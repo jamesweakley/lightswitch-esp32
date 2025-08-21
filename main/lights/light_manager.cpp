@@ -113,6 +113,12 @@ esp_err_t light_manager_init()
 {
     leds_init();
     buttons_init();
+    // Startup logging: confirm logging is working and show configuration
+    ESP_LOGI(TAG, "Light manager init: %d channel(s), poll=%dms, debounce=%d", (int)LIGHT_CHANNELS, (int)BUTTON_POLL_MS, (int)BUTTON_STABLE_CNT);
+    for (int i = 0; i < LIGHT_CHANNELS; i++) {
+        ESP_LOGI(TAG, "CH%u: button GPIO %d (active-low), LED GPIO %d", (unsigned)i, (int)s_button_gpios[i], (int)s_led_gpios[i]);
+    }
+    ESP_LOGI(TAG, "DHT22 GPIO %d", (int)DHT22_GPIO);
     // Register group request callback to actually send group commands when bindings trigger updates
     esp_matter::client::set_request_callback(nullptr,
         [](uint8_t fabric_index, esp_matter::client::request_handle *req, void *priv) {
@@ -123,6 +129,7 @@ esp_err_t light_manager_init()
         nullptr);
     // Start button polling
     xTaskCreate(button_task, "btn_poll", 2048, nullptr, 5, &s_button_task);
+    ESP_LOGI(TAG, "Light manager started");
     return ESP_OK;
 }
 
@@ -261,6 +268,8 @@ static void send_group_toggle(uint8_t ch)
 
 void light_manager_button_press(uint8_t channel)
 {
+    // Log button press
+    ESP_LOGI(TAG, "Button %u pressed (GPIO %d)", channel, (int)s_button_gpios[channel]);
     // Brief LED blink to acknowledge press
     if (channel >= LIGHT_CHANNELS) return;
     apply_led(channel, 1);

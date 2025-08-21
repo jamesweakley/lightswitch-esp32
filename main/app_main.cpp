@@ -224,6 +224,13 @@ static esp_err_t app_attribute_update_cb(attribute::callback_type_t type, uint16
 
 extern "C" void app_main()
 {
+    // Ensure logging is visible as early as possible
+    ESP_EARLY_LOGI(TAG, "app_main start (build %s %s)", __DATE__, __TIME__);
+    // Set global log level to INFO (and our tags explicitly) in case sdkconfig differs
+    esp_log_level_set("*", ESP_LOG_INFO);
+    esp_log_level_set("app_main", ESP_LOG_INFO);
+    esp_log_level_set("light_manager", ESP_LOG_INFO);
+
     esp_err_t err = ESP_OK;
 
     /* Initialize the ESP NVS layer */
