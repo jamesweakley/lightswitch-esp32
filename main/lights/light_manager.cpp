@@ -64,9 +64,15 @@ static void buttons_init()
 
     for (int i = 0; i < LIGHT_CHANNELS; i++) {
         if (s_button_gpios[i] == GPIO_NUM_NC) continue;
+        // ESP32-C6 valid digital IO range is 8..30; warn if outside
+        if (s_button_gpios[i] < GPIO_NUM_8 || s_button_gpios[i] > GPIO_NUM_30) {
+            ESP_LOGW(TAG, "CH%u: button GPIO %d may be invalid on ESP32-C6 (use 8..30)", i, (int)s_button_gpios[i]);
+        }
         in_cfg.pin_bit_mask = (1ULL << s_button_gpios[i]);
         gpio_config(&in_cfg);
         gpio_set_pull_mode(s_button_gpios[i], GPIO_PULLUP_ONLY);
+        int lvl = gpio_get_level(s_button_gpios[i]);
+        ESP_LOGI(TAG, "CH%u: button GPIO %d configured with pull-up, initial level=%d", i, (int)s_button_gpios[i], lvl);
     }
 }
 

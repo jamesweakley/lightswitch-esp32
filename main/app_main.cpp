@@ -34,6 +34,10 @@
 #include <app/server/Server.h>
 
 static const char *TAG = "app_main";
+// Prevent light sleep during debug to keep USB Serial/JTAG stable
+#if CONFIG_PM_ENABLE
+static esp_pm_lock_handle_t s_pm_no_ls_lock = nullptr;
+#endif
 // Endpoint IDs for our new device
 extern uint16_t g_onoff_endpoint_ids[LIGHT_CHANNELS];
 extern uint16_t g_temp_endpoint_id;
@@ -232,6 +236,19 @@ extern "C" void app_main()
     esp_log_level_set("light_manager", ESP_LOG_INFO);
 
     esp_err_t err = ESP_OK;
+
+#if CONFIG_PM_ENABLE
+    // Acquire a PM lock to disable light sleep; helps OpenOCD keep JTAG connected
+    if (s_pm_no_ls_lock == nullptr) {
+        esp_err_t lerr = esp_pm_lock_create(ESP_PM_NO_LIGHT_SLEEP, 0, "debug", &s_pm_no_ls_lock);
+        if (lerr == ESP_OK) {
+            esp_pm_lock_acquire(s_pm_no_ls_lock);
+            ESP_LOGW(TAG, "Light sleep disabled via PM lock for debugging");
+        } else {
+            ESP_LOGW(TAG, "Failed to create PM lock, err=%d", (int)lerr);
+        }
+    }
+#endif
 
     /* Initialize the ESP NVS layer */
     err = nvs_flash_init();

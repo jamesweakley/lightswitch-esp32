@@ -12,18 +12,18 @@
 #define LIGHT_CHANNELS 4
 #endif
 
-// Button GPIOs (active-low, use internal pull-ups). Defaults chosen for ESP32-C6-Pico.
+// Button GPIOs (active-low, use internal pull-ups). Use valid ESP32-C6 pins.
 #ifndef BUTTON_GPIO_0
-#define BUTTON_GPIO_0 GPIO_NUM_4
+#define BUTTON_GPIO_0 GPIO_NUM_16
 #endif
 #ifndef BUTTON_GPIO_1
-#define BUTTON_GPIO_1 GPIO_NUM_5
+#define BUTTON_GPIO_1 GPIO_NUM_17
 #endif
 #ifndef BUTTON_GPIO_2
-#define BUTTON_GPIO_2 GPIO_NUM_6
+#define BUTTON_GPIO_2 GPIO_NUM_18
 #endif
 #ifndef BUTTON_GPIO_3
-#define BUTTON_GPIO_3 GPIO_NUM_7
+#define BUTTON_GPIO_3 GPIO_NUM_19
 #endif
 
 // LED GPIOs for the button indicator LEDs (active-high outputs)
