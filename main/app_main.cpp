@@ -14,6 +14,8 @@
 #include <esp_pm.h>
 #endif
 
+#include <inttypes.h>
+
 #include <esp_matter.h>
 #include <esp_matter_console.h>
 #include <esp_matter_ota.h>
@@ -34,6 +36,11 @@
 #include <app/server/Server.h>
 
 static const char *TAG = "app_main";
+
+// Define globals declared in light_manager.h
+uint16_t g_onoff_endpoint_ids[LIGHT_CHANNELS] = {0};
+uint16_t g_temp_endpoint_id = 0;
+uint16_t g_humidity_endpoint_id = 0;
 // Prevent light sleep during debug to keep USB Serial/JTAG stable
 #if CONFIG_PM_ENABLE
 static esp_pm_lock_handle_t s_pm_no_ls_lock = nullptr;
@@ -221,6 +228,19 @@ static esp_err_t app_attribute_update_cb(attribute::callback_type_t type, uint16
 {
     esp_err_t err = ESP_OK;
 
+    // Interpret important attribute updates for easier debugging
+    if (cluster_id == chip::app::Clusters::Binding::Id) {
+        // Binding cluster writes/reads. Attribute 0x0000 is the Binding table list.
+        if (type == attribute::PRE_UPDATE) {
+            ESP_LOGI(TAG, "Binding attribute PRE_UPDATE: ep=%u attr=0x%08" PRIx32, endpoint_id, attribute_id);
+        } else if (type == attribute::POST_UPDATE) {
+            ESP_LOGI(TAG, "Binding attribute POST_UPDATE: ep=%u attr=0x%08" PRIx32, endpoint_id, attribute_id);
+        } else {
+            ESP_LOGI(TAG, "Binding attribute CB: ep=%u attr=0x%08" PRIx32 " type=%d", endpoint_id, attribute_id, (int)type);
+        }
+        return err;
+    }
+
     // No local attribute mirroring in controller mode
 
     return err;
@@ -310,16 +330,23 @@ extern "C" void app_main()
     node_t *node = node::create(&node_config, app_attribute_update_cb, app_identification_cb);
     ABORT_APP_ON_FAILURE(node != nullptr, ESP_LOGE(TAG, "Failed to create Matter node"));
 
-    // Create up to 4 On/Off Light endpoints
+    // Create up to 4 On/Off Light Switch controller endpoints (CLIENT OnOff + Binding SERVER)
     for (int i = 0; i < LIGHT_CHANNELS; i++) {
-        on_off_light::config_t cfg = {};
-        endpoint_t *ep = on_off_light::create(node, &cfg, ENDPOINT_FLAG_NONE, NULL);
-        ABORT_APP_ON_FAILURE(ep != nullptr, ESP_LOGE(TAG, "Failed to create on/off light endpoint %d", i));
+        // Use generic endpoint creator then add desired clusters manually for clarity.
+        endpoint_t *ep = endpoint::create(node, ENDPOINT_FLAG_NONE, NULL);
+        ABORT_APP_ON_FAILURE(ep != nullptr, ESP_LOGE(TAG, "Failed to create endpoint for switch %d", i));
         g_onoff_endpoint_ids[i] = endpoint::get_id(ep);
-    // Add Binding cluster so this endpoint can drive bound devices/groups
-    cluster_t *binding = cluster::binding::create(ep, nullptr, CLUSTER_FLAG_SERVER);
-    (void)binding;
-        ESP_LOGI(TAG, "Light channel %d endpoint_id=%d", i, g_onoff_endpoint_ids[i]);
+        // Add device type: On/Off Light Switch (0x0103) so ecosystems show a switch, not a lamp.
+        endpoint::add_device_type(ep, 0x0103, 1 /*rev*/);
+    // Add OnOff client cluster (needs config struct, then flags)
+    cluster::on_off::config_t onoff_cfg = {};
+    cluster_t *onoff_client = cluster::on_off::create(ep, &onoff_cfg, CLUSTER_FLAG_CLIENT, 0);
+        (void)onoff_client;
+    // Add Binding server cluster (common config, no extra flags)
+    cluster::common::config_t binding_cfg = {};
+    cluster_t *binding = cluster::binding::create(ep, &binding_cfg, CLUSTER_FLAG_SERVER);
+        (void)binding;
+        ESP_LOGI(TAG, "Switch channel %d endpoint_id=%d (OnOff client)", i, g_onoff_endpoint_ids[i]);
     }
 
     // Create Temperature and Humidity sensor endpoints

@@ -3,8 +3,8 @@
   "idf.toolsPath": "/Users/jamesweakley/.espressif",
   "idf.pythonInstallPath": "/Library/Frameworks/Python.framework/Versions/3.12/bin/python3",
   "idf.flashType": "JTAG",
-  "idf.port": "/dev/tty.usbmodem1101",
-  "idf.monitorPort": "/dev/tty.usbmodem1101",
+  "idf.port": "/dev/tty.usbmodem14201",
+  "idf.monitorPort": "/dev/tty.usbmodem14201",
   "idf.openOcdConfigs": [
     "board/esp32c6-builtin.cfg"
   ],
