@@ -128,6 +128,37 @@ chip-tool binding read binding <controller-node-id> <switch-endpoint>
 
 You should see the JSON list matching what you wrote.
 
+### Shadow Binding Helper (Local Incremental Adds)
+
+This firmware also exposes a local "shadow" binding list per channel that is persisted in NVS and can be modified incrementally via the serial console. This shadow list is intended for workflows where you want to accumulate unicast targets one at a time without rewriting the full Binding attribute from a commissioner.
+
+Important limitations (Option A design choice):
+* Shadow list DOES NOT currently rewrite the official Binding attribute (it is only logged + persisted locally).
+* Commissioners will not see shadow-added entries when reading the Binding list; they only see what was written through standard Matter writes.
+* Future work could promote the shadow content into the real Binding attribute once a stable public API for list writes is available.
+
+Console commands (enable CHIP shell in sdkconfig):
+
+| Command | Description |
+|---------|-------------|
+| `bind-add <ch> <node-id-hex> <endpoint> [cluster-hex]` | Append a unicast target to channel shadow list (default cluster 0x0006). Saves to NVS. |
+| `bind-list [ch]` | List shadow bindings for all channels or a specific channel. |
+| `bind-remove <ch> <index>` | Remove entry at index from channel's shadow list (then persists). |
+| `bind-clear <ch>` | Clear channel's shadow list (then persists). |
+| `bind-commit <ch>` | Re-persist & log channel list (placeholder for future real Binding write). |
+
+Example: add two bulbs (Node IDs 0x111... & 0x222...) to channel 0 incrementally:
+
+```
+bind-add 0 1111111111111111 1
+bind-add 0 2222222222222222 1
+bind-list 0
+```
+
+After reboot the shadow list is auto-loaded and logged; use `bind-list` to inspect.
+
+To actually create operative bindings today, still perform standard Binding cluster writes (previous sections). The shadow facility is a staging / persistence aid only in this Option A build.
+
 ### Clearing / Replacing Bindings
 
 Write an empty list (`[]`) to clear, or just write a new list to replace.
@@ -157,6 +188,7 @@ Use a standard Matter factory reset mechanism (e.g. long button hold if implemen
 * Remote On/Off state aggregation to illuminate LEDs if **any** bound targets are ON.
 * Persistent user-configurable group IDs via NVS.
 * OTA / delta update integration (infrastructure already present in esp-matter dependencies).
+* Promotion of shadow binding list into official Binding attribute (replacing placeholder) when public API allows safe structured list writes.
 
 ## References
 

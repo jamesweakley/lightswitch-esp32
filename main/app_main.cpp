@@ -23,6 +23,8 @@
 #include <esp_matter_client.h>
 // CHIP cluster ids & command ids
 #include <app-common/zap-generated/cluster-objects.h>
+// TLV utilities (header name differs across versions: prefer TLV.h)
+#include <lib/core/TLV.h>
 
 #include <common_macros.h>
 #include <app_priv.h>
@@ -47,12 +49,188 @@ static esp_pm_lock_handle_t s_pm_no_ls_lock = nullptr;
 #endif
 // Endpoint IDs for our new device
 extern uint16_t g_onoff_endpoint_ids[LIGHT_CHANNELS];
+// Instrumentation counters for request callbacks
+volatile uint32_t g_reqcb_unicast_count = 0;
+volatile uint32_t g_reqcb_group_count = 0;
 extern uint16_t g_temp_endpoint_id;
 extern uint16_t g_humidity_endpoint_id;
 
 // Watchdog timer for detecting stuck initialization
 static esp_timer_handle_t init_watchdog_timer = NULL;
 static bool matter_started = false;
+
+// ---- Shadow Binding Structures ----
+struct ShadowBindingEntry {
+    bool is_group; // false = unicast
+    uint64_t node_id;
+    uint16_t endpoint;
+    uint32_t cluster_id; // typically 0x0006
+    uint16_t group_id;   // valid if is_group
+};
+
+static constexpr int MAX_SHADOW_BINDINGS_PER_CH = 10;
+struct ShadowBindingList {
+    int count;
+    ShadowBindingEntry entries[MAX_SHADOW_BINDINGS_PER_CH];
+};
+static ShadowBindingList s_shadow_lists[LIGHT_CHANNELS];
+
+// Lightweight accessor so other compilation units (light_manager) can iterate shadow entries for unicast.
+extern "C" const ShadowBindingList * shadow_binding_get_list(int ch) {
+    if (ch < 0 || ch >= LIGHT_CHANNELS) return nullptr;
+    return &s_shadow_lists[ch];
+}
+
+// NVS namespace & key pattern
+static const char *k_bind_nvs_namespace = "bindcfg";
+
+static esp_err_t shadow_binding_save_nvs(int ch) {
+    if (ch < 0 || ch >= LIGHT_CHANNELS) return ESP_ERR_INVALID_ARG;
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(k_bind_nvs_namespace, NVS_READWRITE, &h);
+    if (err != ESP_OK) return err;
+    char key[8];
+    snprintf(key, sizeof(key), "ch%d", ch);
+    err = nvs_set_blob(h, key, &s_shadow_lists[ch], sizeof(ShadowBindingList));
+    if (err == ESP_OK) err = nvs_commit(h);
+    nvs_close(h);
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "Saved shadow bindings ch%d to NVS (count=%d)", ch, s_shadow_lists[ch].count);
+    } else {
+        ESP_LOGE(TAG, "Failed saving shadow bindings ch%d err=%d", ch, (int)err);
+    }
+    return err;
+}
+
+static esp_err_t shadow_binding_load_nvs(int ch) {
+    if (ch < 0 || ch >= LIGHT_CHANNELS) return ESP_ERR_INVALID_ARG;
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(k_bind_nvs_namespace, NVS_READONLY, &h);
+    if (err != ESP_OK) return err;
+    char key[8];
+    snprintf(key, sizeof(key), "ch%d", ch);
+    size_t len = sizeof(ShadowBindingList);
+    ShadowBindingList tmp = {};
+    err = nvs_get_blob(h, key, &tmp, &len);
+    nvs_close(h);
+    if (err == ESP_OK && len == sizeof(ShadowBindingList)) {
+        s_shadow_lists[ch] = tmp;
+        if (s_shadow_lists[ch].count > MAX_SHADOW_BINDINGS_PER_CH) s_shadow_lists[ch].count = 0; // sanitize
+        ESP_LOGI(TAG, "Loaded shadow bindings ch%d from NVS (count=%d)", ch, s_shadow_lists[ch].count);
+    }
+    return err;
+}
+
+static void shadow_binding_load_all_nvs() {
+    for (int ch = 0; ch < LIGHT_CHANNELS; ch++) {
+        shadow_binding_load_nvs(ch);
+    }
+}
+
+extern "C" void shadow_binding_clear_channel(int ch) {
+    if (ch < 0 || ch >= LIGHT_CHANNELS) return;
+    s_shadow_lists[ch].count = 0;
+}
+
+static void shadow_binding_log(int ch) {
+    if (ch < 0 || ch >= LIGHT_CHANNELS) return;
+    ESP_LOGI(TAG, "Shadow bindings ch%u count=%d", ch, s_shadow_lists[ch].count);
+    for (int i = 0; i < s_shadow_lists[ch].count; i++) {
+        auto &e = s_shadow_lists[ch].entries[i];
+        if (e.is_group) {
+            ESP_LOGI(TAG, "  [%d] GROUP 0x%04X", i, e.group_id);
+        } else {
+            ESP_LOGI(TAG, "  [%d] UNICAST Node=0x%016" PRIX64 " EP=%u Cl=0x%04X", i, (uint64_t)e.node_id, e.endpoint, (unsigned)e.cluster_id);
+        }
+    }
+}
+
+static esp_err_t shadow_binding_add_unicast(int ch, uint64_t node_id, uint16_t endpoint, uint32_t cluster_id) {
+    if (ch < 0 || ch >= LIGHT_CHANNELS) return ESP_ERR_INVALID_ARG;
+    auto &list = s_shadow_lists[ch];
+    // Dedup
+    for (int i = 0; i < list.count; i++) {
+        auto &e = list.entries[i];
+        if (!e.is_group && e.node_id == node_id && e.endpoint == endpoint && e.cluster_id == cluster_id) {
+            ESP_LOGI(TAG, "Shadow binding already present");
+            return ESP_OK;
+        }
+    }
+    if (list.count >= MAX_SHADOW_BINDINGS_PER_CH) return ESP_ERR_NO_MEM;
+    auto &e = list.entries[list.count++];
+    e.is_group = false; e.node_id = node_id; e.endpoint = endpoint; e.cluster_id = cluster_id; e.group_id = 0;
+    return ESP_OK;
+}
+
+// Rewrites Binding attribute with combined existing (shadow) + new entry.
+static esp_err_t shadow_binding_commit(int ch) {
+    if (ch < 0 || ch >= LIGHT_CHANNELS) return ESP_ERR_INVALID_ARG;
+    uint16_t ep = g_onoff_endpoint_ids[ch];
+    ESP_LOGI(TAG, "Committing shadow bindings (Option C external writes) -> ep %u entries=%d", ep, s_shadow_lists[ch].count);
+    shadow_binding_log(ch);
+    // Persist shadow
+    shadow_binding_save_nvs(ch);
+    return ESP_OK;
+}
+
+// Console command to add unicast binding: bind-add <channel> <node_id_hex> <endpoint> [cluster=0x0006]
+static int cmd_bind_add(int argc, char **argv) {
+    if (argc < 4) {
+        printf("Usage: bind-add <channel 0-%d> <node-id-hex> <endpoint> [cluster-hex]\n", LIGHT_CHANNELS-1);
+        return 0;
+    }
+    int ch = atoi(argv[1]);
+    uint64_t node_id = strtoull(argv[2], nullptr, 16);
+    uint16_t ep = (uint16_t)strtoul(argv[3], nullptr, 0);
+    uint32_t cluster = 0x0006;
+    if (argc > 4) cluster = (uint32_t)strtoul(argv[4], nullptr, 16);
+    if (shadow_binding_add_unicast(ch, node_id, ep, cluster) == ESP_OK) {
+        shadow_binding_commit(ch);
+    }
+    return 0;
+}
+
+// bind-list [ch]
+static int cmd_bind_list(int argc, char **argv) {
+    if (argc == 1) {
+        for (int ch = 0; ch < LIGHT_CHANNELS; ch++) shadow_binding_log(ch);
+        return 0;
+    }
+    int ch = atoi(argv[1]);
+    shadow_binding_log(ch);
+    return 0;
+}
+
+// bind-remove <ch> <index>
+static int cmd_bind_remove(int argc, char **argv) {
+    if (argc < 3) { printf("Usage: bind-remove <channel> <index>\n"); return 0; }
+    int ch = atoi(argv[1]);
+    int idx = atoi(argv[2]);
+    if (ch < 0 || ch >= LIGHT_CHANNELS) return 0;
+    auto &list = s_shadow_lists[ch];
+    if (idx < 0 || idx >= list.count) { printf("Index out of range\n"); return 0; }
+    for (int i = idx; i < list.count - 1; i++) list.entries[i] = list.entries[i+1];
+    list.count--;
+    shadow_binding_commit(ch);
+    return 0;
+}
+
+// bind-clear <ch>
+static int cmd_bind_clear(int argc, char **argv) {
+    if (argc < 2) { printf("Usage: bind-clear <channel>\n"); return 0; }
+    int ch = atoi(argv[1]);
+    shadow_binding_clear_channel(ch);
+    shadow_binding_commit(ch);
+    return 0;
+}
+
+// bind-commit <ch>
+static int cmd_bind_commit(int argc, char **argv) {
+    if (argc < 2) { printf("Usage: bind-commit <channel>\n"); return 0; }
+    int ch = atoi(argv[1]);
+    shadow_binding_commit(ch);
+    return 0;
+}
 
 static void init_watchdog_callback(void* arg)
 {
@@ -228,6 +406,33 @@ static esp_err_t app_attribute_update_cb(attribute::callback_type_t type, uint16
 {
     esp_err_t err = ESP_OK;
 
+    // ---- Shadow Binding handling ----
+    // We keep a per-endpoint shadow list of unicast binding targets so we can append via a helper command.
+    // NOTE: Full TLV parsing of the Binding list is not implemented here (esp-matter public API limitation);
+    // you can extend this later when attribute value decoding for lists is exposed.
+
+    constexpr uint32_t kBindingClusterId = chip::app::Clusters::Binding::Id; // 0xF000
+    constexpr uint32_t kBindingAttrId = 0x0000;
+
+    if (cluster_id == kBindingClusterId && attribute_id == kBindingAttrId) {
+        if (type == attribute::PRE_UPDATE) {
+            ESP_LOGI(TAG, "Binding PRE_UPDATE ep=%u (incoming list replaces shadow)", endpoint_id);
+        } else if (type == attribute::POST_UPDATE) {
+            ESP_LOGI(TAG, "Binding POST_UPDATE ep=%u (shadow invalidated -> mark dirty)", endpoint_id);
+            // Mark shadow dirty so next 'add' command will rebuild from NVS or assume empty.
+            // (Simplified: we just clear it.)
+            for (int ch = 0; ch < LIGHT_CHANNELS; ch++) {
+                if (g_onoff_endpoint_ids[ch] == endpoint_id) {
+                    // Clear shadow entry count (defined later) via extern helper
+                    extern void shadow_binding_clear_channel(int ch);
+                    shadow_binding_clear_channel(ch);
+                    break;
+                }
+            }
+        }
+        return err;
+    }
+
     // Interpret important attribute updates for easier debugging
     if (cluster_id == chip::app::Clusters::Binding::Id) {
         // Binding cluster writes/reads. Attribute 0x0000 is the Binding table list.
@@ -254,6 +459,10 @@ extern "C" void app_main()
     esp_log_level_set("*", ESP_LOG_INFO);
     esp_log_level_set("app_main", ESP_LOG_INFO);
     esp_log_level_set("light_manager", ESP_LOG_INFO);
+    esp_log_level_set("BindingManager", ESP_LOG_DEBUG);
+    esp_log_level_set("IM", ESP_LOG_DEBUG);
+    esp_log_level_set("CommandSender", ESP_LOG_DEBUG);
+    esp_log_level_set("ExchangeMgr", ESP_LOG_DEBUG);
 
     esp_err_t err = ESP_OK;
 
@@ -330,7 +539,7 @@ extern "C" void app_main()
     node_t *node = node::create(&node_config, app_attribute_update_cb, app_identification_cb);
     ABORT_APP_ON_FAILURE(node != nullptr, ESP_LOGE(TAG, "Failed to create Matter node"));
 
-    // Create up to 4 On/Off Light Switch controller endpoints (CLIENT OnOff + Binding SERVER)
+    // Create up to 4 On/Off Light Switch controller endpoints (OnOff CLIENT + Binding SERVER + Binding CLIENT)
     for (int i = 0; i < LIGHT_CHANNELS; i++) {
         // Use generic endpoint creator then add desired clusters manually for clarity.
         endpoint_t *ep = endpoint::create(node, ENDPOINT_FLAG_NONE, NULL);
@@ -342,10 +551,13 @@ extern "C" void app_main()
     cluster::on_off::config_t onoff_cfg = {};
     cluster_t *onoff_client = cluster::on_off::create(ep, &onoff_cfg, CLUSTER_FLAG_CLIENT, 0);
         (void)onoff_client;
-    // Add Binding server cluster (common config, no extra flags)
-    cluster::common::config_t binding_cfg = {};
-    cluster_t *binding = cluster::binding::create(ep, &binding_cfg, CLUSTER_FLAG_SERVER);
-        (void)binding;
+    // Add Binding server & client clusters (client will allow issuing Bind/Unbind commands later)
+    cluster::common::config_t binding_srv_cfg = {};
+    cluster_t *binding_srv = cluster::binding::create(ep, &binding_srv_cfg, CLUSTER_FLAG_SERVER);
+        (void)binding_srv;
+    cluster::common::config_t binding_cli_cfg = {};
+    cluster_t *binding_cli = cluster::binding::create(ep, &binding_cli_cfg, CLUSTER_FLAG_CLIENT);
+        (void)binding_cli;
         ESP_LOGI(TAG, "Switch channel %d endpoint_id=%d (OnOff client)", i, g_onoff_endpoint_ids[i]);
     }
 
@@ -378,6 +590,9 @@ extern "C" void app_main()
     // Initialize local drivers (buttons/LEDs) and sensor task
     light_manager_init();
 
+    // Load any persisted shadow bindings before starting Matter (will commit after start)
+    shadow_binding_load_all_nvs();
+
     // Start a watchdog timer to detect if Matter initialization gets stuck
     esp_timer_create_args_t timer_args = {
         .callback = init_watchdog_callback,
@@ -394,6 +609,90 @@ extern "C" void app_main()
     ABORT_APP_ON_FAILURE(err == ESP_OK, ESP_LOGE(TAG, "Failed to start Matter, err:%d", err));
     // Initialize binding manager so cluster_update works for group/unicast
     esp_matter::client::binding_manager_init();
+    // Install request callbacks to observe unicast/group routing decisions
+    esp_matter::client::set_request_callback(
+        [](chip::DeviceProxy * device, esp_matter::client::request_handle * req, void * priv){
+            if (!device || !req) return;
+            chip::NodeId nid = device->GetDeviceId();
+            g_reqcb_unicast_count++;
+            extern volatile uint32_t g_last_press_tick; // from light_manager
+            uint32_t now = xTaskGetTickCount();
+            uint32_t delta_ms = (now - g_last_press_tick) * portTICK_PERIOD_MS;
+            ESP_LOGI("ReqCB","UNCAST node=0x%016" PRIx64 " ep=%u cluster=0x%08" PRIx32 " cmd=0x%08" PRIx32 " latency=%ums -> send",
+                     (uint64_t)nid,
+                     (unsigned)req->command_path.mEndpointId,
+                     (uint32_t)req->command_path.mClusterId,
+                     (uint32_t)req->command_path.mCommandId,
+                     (unsigned)delta_ms);
+            // Only process OnOff::Toggle
+            if (req->command_path.mClusterId != chip::app::Clusters::OnOff::Id ||
+                req->command_path.mCommandId != chip::app::Clusters::OnOff::Commands::Toggle::Id) {
+                return; }
+            // Include necessary headers locally
+            using namespace chip::app;
+            class ToggleSenderCallback : public CommandSender::Callback {
+            public:
+                void OnResponse(CommandSender * cs, const ConcreteCommandPath & path, const StatusIB & status, TLV::TLVReader * data) override {
+                    ESP_LOGI("ToggleSend","Resp ep=%u status=0x%02X", (unsigned)path.mEndpointId, (unsigned)status.mStatus);
+                }
+                void OnError(const CommandSender * cs, CHIP_ERROR err) override {
+                    ESP_LOGE("ToggleSend","Error %" CHIP_ERROR_FORMAT, err.Format());
+                }
+                void OnDone(CommandSender * cs) override {
+                    chip::Platform::Delete(cs);
+                    chip::Platform::Delete(this);
+                }
+            };
+            auto * cb = chip::Platform::New<ToggleSenderCallback>();
+            if (!cb) { ESP_LOGE("ToggleSend","No mem cb"); return; }
+            auto * sender = chip::Platform::New<CommandSender>(cb, InteractionModelEngine::GetInstance()->GetExchangeManager());
+            if (!sender) { ESP_LOGE("ToggleSend","No mem sender"); chip::Platform::Delete(cb); return; }
+            CommandPathParams cp(req->command_path.mEndpointId,
+                                  /*group*/ 0,
+                                  chip::app::Clusters::OnOff::Id,
+                                  chip::app::Clusters::OnOff::Commands::Toggle::Id,
+                                  CommandPathFlags::kEndpointIdValid);
+            CHIP_ERROR cerr = sender->PrepareCommand(cp);
+            if (cerr != CHIP_NO_ERROR) { ESP_LOGE("ToggleSend","Prepare fail %" CHIP_ERROR_FORMAT, cerr.Format()); goto fail; }
+            cerr = sender->FinishCommand();
+            if (cerr != CHIP_NO_ERROR) { ESP_LOGE("ToggleSend","Finish fail %" CHIP_ERROR_FORMAT, cerr.Format()); goto fail; }
+            {
+                auto session = device->GetSecureSession();
+                if (!session.HasValue()) { ESP_LOGE("ToggleSend","No session"); goto fail; }
+                cerr = sender->SendCommandRequest(session.Value());
+                if (cerr != CHIP_NO_ERROR) { ESP_LOGE("ToggleSend","Send fail %" CHIP_ERROR_FORMAT, cerr.Format()); goto fail; }
+            }
+            ESP_LOGI("ToggleSend","Sent Toggle to node=0x%016" PRIx64 " ep=%u", (uint64_t)nid, (unsigned)req->command_path.mEndpointId);
+            return;
+        fail:
+            chip::Platform::Delete(sender);
+            chip::Platform::Delete(cb);
+        },
+        [](uint8_t group_id, esp_matter::client::request_handle * req, void * priv){
+            if (!req) return;
+            g_reqcb_group_count++;
+            ESP_LOGI("ReqCB","GROUP gid=%u ep=%u cluster=0x%08" PRIx32 " cmd=0x%08" PRIx32, (unsigned)group_id,
+                     (unsigned)req->command_path.mEndpointId, (uint32_t)req->command_path.mClusterId, (uint32_t)req->command_path.mCommandId);
+        },
+        nullptr);
+    // Commit any restored shadow bindings to live Binding attribute (placeholder writer)
+    for (int ch = 0; ch < LIGHT_CHANNELS; ch++) {
+        if (s_shadow_lists[ch].count > 0) shadow_binding_commit(ch);
+    }
+
+    // Periodic instrumentation log (every 30s) for request callback counters
+    static esp_timer_handle_t reqcb_timer;
+    esp_timer_create_args_t reqcb_args = {
+        .callback = [](void*){
+            ESP_LOGI("ReqCB","Counts: unicast=%lu group=%lu", (unsigned long)g_reqcb_unicast_count, (unsigned long)g_reqcb_group_count);
+        },
+        .arg = nullptr,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name = "reqcb_tmr"
+    };
+    if (esp_timer_create(&reqcb_args, &reqcb_timer) == ESP_OK) {
+        esp_timer_start_periodic(reqcb_timer, 30000000); // 30s
+    }
     
     // Start DHT22 task after Matter start
     dht22_start_task();

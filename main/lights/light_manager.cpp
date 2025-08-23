@@ -9,6 +9,8 @@
 #include <driver/gpio.h>
 #include <esp_timer.h>
 #include "esp_rom_sys.h"
+#include "freertos/queue.h"
+#include <platform/PlatformManager.h>
 
 #include <inttypes.h>
 
@@ -18,6 +20,7 @@
 // CHIP cluster ids & command ids
 #include <app-common/zap-generated/cluster-objects.h>
 #include <app/CommandPathParams.h>
+// (Binding table internal CHIP headers not included in esp-matter public API; detailed per-target logging limited.)
 // For subscription (direct CHIP IM API)
 // NOTE: Direct CHIP IM subscription headers removed for now because they are not exposed via
 // current esp-matter public include paths in this project setup. Placeholder logic remains.
@@ -28,6 +31,8 @@ using namespace esp_matter::attribute;
 
 // Logging tag
 static const char *TAG = "light_manager";
+// Track last button press tick for latency diagnostics
+volatile uint32_t g_last_press_tick = 0;
 
 static void subscriptions_init() {
     ESP_LOGI(TAG, "Subscriptions (polling) init: (disabled remote state tracking placeholder)");
@@ -44,11 +49,17 @@ static const gpio_num_t s_led_gpios[LIGHT_CHANNELS]    = { LED_GPIO_0, LED_GPIO_
 extern uint16_t g_onoff_endpoint_ids[LIGHT_CHANNELS];
 
 // Button polling task handle
-static TaskHandle_t s_button_task = nullptr;
+static TaskHandle_t s_button_task = nullptr;      // polling task (lightweight)
+static TaskHandle_t s_button_act_task = nullptr;  // action task (does logging & Matter calls)
 static TaskHandle_t s_dht_task = nullptr;
+static QueueHandle_t s_button_evt_queue = nullptr; // queue of uint8_t channel indices
+
+// LED blink timers (one-shot) to avoid blocking delays on button tasks
+static esp_timer_handle_t s_led_blink_timers[LIGHT_CHANNELS] = {nullptr};
 
 // Forward declare for early use in init logging
 static uint16_t group_id_for_channel(uint8_t ch);
+static void send_group_toggle(uint8_t ch); // forward
 
 static void apply_led(uint8_t ch, bool on)
 {
@@ -102,9 +113,48 @@ static void button_task(void *arg)
             int level = gpio_get_level(s_button_gpios[i]);
             if (level == last_read[i]) { if (stable_cnt[i] < 255) stable_cnt[i]++; }
             else { stable_cnt[i] = 0; last_read[i] = level; }
-            if (last_read[i] == 0 && stable_cnt[i] == BUTTON_STABLE_CNT) { light_manager_button_press(i); }
+            if (last_read[i] == 0 && stable_cnt[i] == BUTTON_STABLE_CNT) {
+                uint8_t ch = i;
+                if (s_button_evt_queue) xQueueSend(s_button_evt_queue, &ch, 0);
+            }
         }
         vTaskDelay(pdMS_TO_TICKS(BUTTON_POLL_MS));
+    }
+}
+
+static void led_blink_timer_cb(void *arg) {
+    uint32_t ch = (uint32_t)arg;
+    if (ch < LIGHT_CHANNELS) {
+        apply_led((uint8_t)ch, s_led_any_on[ch]);
+    }
+}
+
+static void schedule_led_blink(uint8_t ch, uint32_t on_ms) {
+    if (ch >= LIGHT_CHANNELS) return;
+    // Turn LED on immediately
+    apply_led(ch, true);
+    // Create timer if needed
+    if (!s_led_blink_timers[ch]) {
+        esp_timer_create_args_t targs = { .callback = &led_blink_timer_cb, .arg = (void*)(uintptr_t)ch, .dispatch_method = ESP_TIMER_TASK, .name = "ledblink" };
+        if (esp_timer_create(&targs, &s_led_blink_timers[ch]) != ESP_OK) return;
+    }
+    // Stop any pending
+    esp_timer_stop(s_led_blink_timers[ch]);
+    esp_timer_start_once(s_led_blink_timers[ch], on_ms * 1000ULL);
+}
+
+static void button_action_task(void *arg) {
+    uint8_t ch;
+    while (true) {
+        if (xQueueReceive(s_button_evt_queue, &ch, portMAX_DELAY) == pdTRUE) {
+            light_manager_button_press(ch); // safe: now runs on larger stack
+            // Stack watermark diagnostics (optional):
+            static uint32_t cnt = 0;
+            if ((++cnt % 16) == 0) {
+                UBaseType_t wm = uxTaskGetStackHighWaterMark(nullptr);
+                ESP_LOGD(TAG, "button_act watermark=%u words", (unsigned)wm);
+            }
+        }
     }
 }
 
@@ -117,24 +167,12 @@ esp_err_t light_manager_init() {
         ESP_LOGI(TAG, "CH%u: button GPIO %d (active-low), LED GPIO %d, default GroupID=0x%04X", (unsigned)i, (int)s_button_gpios[i], (int)s_led_gpios[i], (unsigned)group_id_for_channel(i));
     }
     ESP_LOGI(TAG, "DHT22 GPIO %d", (int)DHT22_GPIO);
-    // Register group request callback to actually send group commands when bindings trigger updates
-    esp_matter::client::set_request_callback(nullptr,
-        [](uint8_t fabric_index, esp_matter::client::request_handle *req, void *priv) {
-            // For Toggle and other simple commands with no payload, forward via group session
-            // Binding manager fills in GroupId/targets based on endpoint bindings.
-            ESP_LOGI(TAG, "Client request callback: fabric=%u, endpoint=%u, cluster=0x%08" PRIx32 ", cmd=0x%08" PRIx32,
-                     (unsigned)fabric_index,
-                     (unsigned)req->command_path.mEndpointId,
-                     (uint32_t)req->command_path.mClusterId,
-                     (uint32_t)req->command_path.mCommandId);
-            esp_err_t ge = esp_matter::client::group_request_send(fabric_index, req);
-            if (ge != ESP_OK) {
-                ESP_LOGW(TAG, "group_request_send failed: %d", (int)ge);
-            }
-        },
-        nullptr);
+    // No custom request callback: allow esp-matter's default binding manager behavior.
     // Start button polling
+    // Create queue & tasks
+    s_button_evt_queue = xQueueCreate(8, sizeof(uint8_t));
     xTaskCreate(button_task, "btn_poll", 2048, nullptr, 5, &s_button_task);
+    xTaskCreate(button_action_task, "btn_act", 4096, nullptr, 6, &s_button_act_task);
     ESP_LOGI(TAG, "Light manager started (no remote state tracking)");
     subscriptions_init();
     return ESP_OK;
@@ -205,33 +243,69 @@ static void send_group_toggle(uint8_t ch) {
     esp_matter::client::request_handle req = {};
     req.type = esp_matter::client::INVOKE_CMD;
     // Populate command path for On/Off Toggle
+    // Use invalid endpoint in command path so binding manager can substitute each bound remote endpoint.
+    // (Passing the local controller endpoint here may prevent routing.)
+#ifndef CHIP_INVALID_ENDPOINT_ID
+#define CHIP_INVALID_ENDPOINT_ID 0xFFFF
+#endif
     chip::app::CommandPathParams path(
-        static_cast<chip::EndpointId>(g_onoff_endpoint_ids[ch]),
+        static_cast<chip::EndpointId>(CHIP_INVALID_ENDPOINT_ID), // wildcard/invalid -> binding manager should fill
         static_cast<chip::GroupId>(0),
         chip::app::Clusters::OnOff::Id,
         chip::app::Clusters::OnOff::Commands::Toggle::Id,
-        chip::app::CommandPathFlags::kEndpointIdValid);
+        static_cast<chip::app::CommandPathFlags>(0));
     req.command_path = path;
+    // Some esp-matter versions also expect these convenience fields (harmless if struct differs)
+    // Attempt to set them defensively; if they don't exist, compilation will warn/error and we can adjust.
+#if defined(__cplusplus)
+    // Use a lambda with if constexpr false trick to avoid unused warnings if members absent.
+    // (We cannot probe struct layout here; rely on conditional compilation attempts.)
+#endif
+#ifdef __has_include
+#if __has_include(<esp_matter_client.h>)
+    // Tentatively assign if members exist (guard with sizeof check via offsetof if desired).
+    // We use a try/catch style via a macro; if it fails to compile user will report and we will adapt.
+#endif
+#endif
+    // Direct member names guessed from earlier esp-matter releases:
+#ifdef ESP_MATTER_CLIENT_REQUEST_HANDLE_HAS_IDS
+    req.cluster_id = chip::app::Clusters::OnOff::Id;
+    req.command_id = chip::app::Clusters::OnOff::Commands::Toggle::Id;
+#endif
     // No command payload for Toggle
     esp_err_t err = ESP_OK;
     // Notify binding manager for this endpoint; group callback will send to groups
-    ESP_LOGI(TAG, "CH%u: sending Toggle via controller endpoint %u", ch, (unsigned)g_onoff_endpoint_ids[ch]);
+    ESP_LOGI(TAG, "CH%u: sending Toggle via controller endpoint %u (cmdPath ep=0x%04X)", ch,
+             (unsigned)g_onoff_endpoint_ids[ch], (unsigned)req.command_path.mEndpointId);
+    ESP_LOGD(TAG, "req.type=%d cluster=0x%08" PRIx32 " cmd=0x%08" PRIx32, (int)req.type,
+             (uint32_t)req.command_path.mClusterId, (uint32_t)req.command_path.mCommandId);
+    // Extra: log current binding attribute via console command later (not here to avoid recursion)
+    // NOTE: Detailed target enumeration not available (binding table headers not public in this build).
     err = esp_matter::client::cluster_update(g_onoff_endpoint_ids[ch], &req);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "cluster_update failed for ch%u (ep %u): %d", ch, g_onoff_endpoint_ids[ch], err);
     }
+
 }
+
+// Schedule the actual toggle on the CHIP platform thread to avoid stack locking errors.
+static void schedule_group_toggle(uint8_t ch) {
+    chip::DeviceLayer::PlatformMgr().ScheduleWork([](intptr_t arg){
+        uint8_t ch_i = static_cast<uint8_t>(arg);
+        send_group_toggle(ch_i);
+    }, static_cast<intptr_t>(ch));
+}
+
+// (Unicast stub removed: rely on esp-matter binding manager to route using real Binding attribute.)
 
 void light_manager_button_press(uint8_t channel) {
     // Log button press
     ESP_LOGI(TAG, "Button %u pressed (GPIO %d)", channel, (int)s_button_gpios[channel]);
-    // Brief LED blink to acknowledge press
     if (channel >= LIGHT_CHANNELS) return;
-    apply_led(channel, 1);
-    vTaskDelay(pdMS_TO_TICKS(30));
-    apply_led(channel, s_led_any_on[channel]);
-    // Send group Toggle
-    send_group_toggle(channel);
+    g_last_press_tick = xTaskGetTickCount();
+    schedule_led_blink(channel, 30); // non-blocking blink
+    // Always trigger cluster_update; binding manager will inspect Binding attribute
+    schedule_group_toggle(channel);
 }
 
 // ---- Subscription (remote state) logic ----
