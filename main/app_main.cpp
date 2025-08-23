@@ -607,74 +607,49 @@ extern "C" void app_main()
     /* Matter start */
     err = esp_matter::start(app_event_cb);
     ABORT_APP_ON_FAILURE(err == ESP_OK, ESP_LOGE(TAG, "Failed to start Matter, err:%d", err));
-    // Initialize binding manager so cluster_update works for group/unicast
+    // Initialize binding manager
     esp_matter::client::binding_manager_init();
-    // Install request callbacks to observe unicast/group routing decisions
+    // Install a minimal request callback to actually send Toggle for unicast bindings (esp-matter client does not auto-send)
     esp_matter::client::set_request_callback(
-        [](chip::DeviceProxy * device, esp_matter::client::request_handle * req, void * priv){
+        [](chip::DeviceProxy * device, esp_matter::client::request_handle * req, void *){
             if (!device || !req) return;
-            chip::NodeId nid = device->GetDeviceId();
-            g_reqcb_unicast_count++;
-            extern volatile uint32_t g_last_press_tick; // from light_manager
-            uint32_t now = xTaskGetTickCount();
-            uint32_t delta_ms = (now - g_last_press_tick) * portTICK_PERIOD_MS;
-            ESP_LOGI("ReqCB","UNCAST node=0x%016" PRIx64 " ep=%u cluster=0x%08" PRIx32 " cmd=0x%08" PRIx32 " latency=%ums -> send",
-                     (uint64_t)nid,
-                     (unsigned)req->command_path.mEndpointId,
-                     (uint32_t)req->command_path.mClusterId,
-                     (uint32_t)req->command_path.mCommandId,
-                     (unsigned)delta_ms);
-            // Only process OnOff::Toggle
             if (req->command_path.mClusterId != chip::app::Clusters::OnOff::Id ||
                 req->command_path.mCommandId != chip::app::Clusters::OnOff::Commands::Toggle::Id) {
-                return; }
-            // Include necessary headers locally
+                return; // only handle Toggle
+            }
             using namespace chip::app;
-            class ToggleSenderCallback : public CommandSender::Callback {
+            class CB : public CommandSender::Callback {
             public:
-                void OnResponse(CommandSender * cs, const ConcreteCommandPath & path, const StatusIB & status, TLV::TLVReader * data) override {
+                void OnResponse(CommandSender *, const ConcreteCommandPath & path, const StatusIB & status, TLV::TLVReader *) override {
                     ESP_LOGI("ToggleSend","Resp ep=%u status=0x%02X", (unsigned)path.mEndpointId, (unsigned)status.mStatus);
                 }
-                void OnError(const CommandSender * cs, CHIP_ERROR err) override {
+                void OnError(const CommandSender *, CHIP_ERROR err) override {
                     ESP_LOGE("ToggleSend","Error %" CHIP_ERROR_FORMAT, err.Format());
                 }
-                void OnDone(CommandSender * cs) override {
-                    chip::Platform::Delete(cs);
-                    chip::Platform::Delete(this);
-                }
+                void OnDone(CommandSender * cs) override { chip::Platform::Delete(cs); chip::Platform::Delete(this); }
             };
-            auto * cb = chip::Platform::New<ToggleSenderCallback>();
-            if (!cb) { ESP_LOGE("ToggleSend","No mem cb"); return; }
+            auto * cb = chip::Platform::New<CB>();
+            if (!cb) return;
             auto * sender = chip::Platform::New<CommandSender>(cb, InteractionModelEngine::GetInstance()->GetExchangeManager());
-            if (!sender) { ESP_LOGE("ToggleSend","No mem sender"); chip::Platform::Delete(cb); return; }
-            CommandPathParams cp(req->command_path.mEndpointId,
-                                  /*group*/ 0,
-                                  chip::app::Clusters::OnOff::Id,
-                                  chip::app::Clusters::OnOff::Commands::Toggle::Id,
-                                  CommandPathFlags::kEndpointIdValid);
-            CHIP_ERROR cerr = sender->PrepareCommand(cp);
-            if (cerr != CHIP_NO_ERROR) { ESP_LOGE("ToggleSend","Prepare fail %" CHIP_ERROR_FORMAT, cerr.Format()); goto fail; }
-            cerr = sender->FinishCommand();
-            if (cerr != CHIP_NO_ERROR) { ESP_LOGE("ToggleSend","Finish fail %" CHIP_ERROR_FORMAT, cerr.Format()); goto fail; }
-            {
+            if (!sender) { chip::Platform::Delete(cb); return; }
+            CommandPathParams cp(req->command_path.mEndpointId, 0,
+                                 chip::app::Clusters::OnOff::Id,
+                                 chip::app::Clusters::OnOff::Commands::Toggle::Id,
+                                 CommandPathFlags::kEndpointIdValid);
+            CHIP_ERROR e = sender->PrepareCommand(cp);
+            if (e == CHIP_NO_ERROR) e = sender->FinishCommand();
+            if (e == CHIP_NO_ERROR) {
                 auto session = device->GetSecureSession();
-                if (!session.HasValue()) { ESP_LOGE("ToggleSend","No session"); goto fail; }
-                cerr = sender->SendCommandRequest(session.Value());
-                if (cerr != CHIP_NO_ERROR) { ESP_LOGE("ToggleSend","Send fail %" CHIP_ERROR_FORMAT, cerr.Format()); goto fail; }
+                if (session.HasValue()) e = sender->SendCommandRequest(session.Value()); else e = CHIP_ERROR_INCORRECT_STATE;
             }
-            ESP_LOGI("ToggleSend","Sent Toggle to node=0x%016" PRIx64 " ep=%u", (uint64_t)nid, (unsigned)req->command_path.mEndpointId);
-            return;
-        fail:
-            chip::Platform::Delete(sender);
-            chip::Platform::Delete(cb);
+            if (e != CHIP_NO_ERROR) {
+                ESP_LOGE("ToggleSend","Send path failed %" CHIP_ERROR_FORMAT, e.Format());
+                chip::Platform::Delete(sender); chip::Platform::Delete(cb);
+            } else {
+                ESP_LOGD("ToggleSend","Sent Toggle to node=0x%016" PRIx64, (uint64_t)device->GetDeviceId());
+            }
         },
-        [](uint8_t group_id, esp_matter::client::request_handle * req, void * priv){
-            if (!req) return;
-            g_reqcb_group_count++;
-            ESP_LOGI("ReqCB","GROUP gid=%u ep=%u cluster=0x%08" PRIx32 " cmd=0x%08" PRIx32, (unsigned)group_id,
-                     (unsigned)req->command_path.mEndpointId, (uint32_t)req->command_path.mClusterId, (uint32_t)req->command_path.mCommandId);
-        },
-        nullptr);
+        [](uint8_t, esp_matter::client::request_handle *, void *){}, nullptr);
     // Commit any restored shadow bindings to live Binding attribute (placeholder writer)
     for (int ch = 0; ch < LIGHT_CHANNELS; ch++) {
         if (s_shadow_lists[ch].count > 0) shadow_binding_commit(ch);

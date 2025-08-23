@@ -197,3 +197,10 @@ Use a standard Matter factory reset mechanism (e.g. long button hold if implemen
 
 ---
 If you encounter issues with binding writes, ensure both controller and target devices share the same fabric and that target endpoints have the On/Off **server** cluster enabled.
+
+Provisioning notes (Light nodes 1 and 2, switch controller node 60):
+chip-tool binding write binding '[{"node":2,"endpoint":1,"cluster":6},{"node":1,"endpoint":1,"cluster":6}]' 60 1
+
+chip-tool accesscontrol write acl '[{"privilege":5,"authMode":2,"subjects":[112233],"targets":null},{"privilege":3,"authMode":2,"subjects":[60],"targets":null}]' 2 0
+
+chip-tool accesscontrol write acl '[{"privilege":5,"authMode":2,"subjects":[112233],"targets":null},{"privilege":3,"authMode":2,"subjects":[60],"targets":[{"cluster":6,"endpoint":1,"deviceType":null}]}]' 2 0
