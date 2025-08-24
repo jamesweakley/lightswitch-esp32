@@ -19,6 +19,7 @@ set(EXTRA_COMPONENT_DIRS
     "${ESP_MATTER_PATH}/examples/common"
     "${MATTER_SDK_PATH}/config/esp32/components"
     "${ESP_MATTER_PATH}/components"
+    "${CMAKE_SOURCE_DIR}/components"
     ${extra_components_dirs_append})
 
 project(light_switch)
@@ -38,3 +39,12 @@ idf_build_set_property(C_COMPILE_OPTIONS "-Os" APPEND)
 # For RISCV chips, project_include.cmake sets -Wno-format, but does not clear various
 # flags that depend on -Wformat
 idf_build_set_property(COMPILE_OPTIONS "-Wno-format-nonliteral;-Wno-format-security" APPEND)
+
+# Force inclusion of log_wrap component after other archives so that
+# its wrapper symbols (__wrap_esp_log_write{,v}) resolve references
+# introduced by later-scanned CHIP/OpenThread libraries. Without this
+# the archive appears early and its object is not extracted.
+idf_build_get_property(_elf EXECUTABLE)
+if(TARGET __idf_log_wrap)
+    target_link_options(${_elf} PRIVATE "-Wl,--whole-archive" "$<TARGET_FILE:__idf_log_wrap>" "-Wl,--no-whole-archive")
+endif()

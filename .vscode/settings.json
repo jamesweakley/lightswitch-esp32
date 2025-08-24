@@ -1,5 +1,5 @@
 {
-  "idf.espIdfPath": "/Users/jamesweakley/esp/v5.4/esp-idf",
+  "idf.espIdfPath": "/Users/jamesweakley/esp/v5.5/esp-idf",
   "idf.toolsPath": "/Users/jamesweakley/.espressif",
   "idf.pythonInstallPath": "/Library/Frameworks/Python.framework/Versions/3.12/bin/python3",
   "idf.flashType": "JTAG",
