@@ -1,16 +1,25 @@
 # 4‑Gang Matter Light Switch Controller (ESP32‑C6)
 
-This firmware turns an ESP32‑C6 into a 4‑channel ("gang") Matter light switch controller with:
+Production‑oriented firmware turning an ESP32‑C6 into a 4‑channel ("gang") **Matter Light Switch Controller** with optional temperature + humidity sensing. This README is intentionally concise; deeper details live in `docs/` for both humans and GitHub Copilot. See:
 
-* 4 momentary buttons (active‑low, internal pull‑ups enabled)
+* `docs/architecture.md` – high‑level design, data flow, tasks, endpoints
+* `docs/development.md` – build, flash, debug, customization, common tasks
+* `docs/hardware.md` – wiring, GPIO mapping, overrides
+* `.github/copilot-instructions.md` – guidance for AI assistants (naming, extension points)
+
+## Features
+
+* 4 momentary buttons (active‑low, internal pull‑ups)
 * 4 indicator LEDs (active‑high)
 * DHT22 (Temperature + Humidity) sensor endpoints
-* On/Off Light Switch device type (0x0103) per channel with an On/Off **client** cluster (0x0006) + Binding **server** cluster (0xF000)
-* Default Group IDs for quick group control (0x0001..0x0004) – can be overridden by Binding writes
+* Per channel On/Off Light Switch device type (0x0103) with On/Off **client** cluster (0x0006) & Binding **server** cluster (0xF000)
+* Default group IDs (0x0001..0x0004) for immediate group multicast control
+* Shadow binding helper console commands (`bind-add`, `bind-list`, etc.) with NVS persistence stub
+* Watchdog for stuck Matter init + optional power‑management lock while debugging
 
-It issues Toggle commands (On/Off cluster, command 0x02) via the esp-matter client & binding manager. Indicator LEDs currently blink on press (remote state feedback can be added in future).
+LEDs blink on press (remote state aggregation currently disabled; planned improvement).
 
-## Hardware Pin Mapping
+## Hardware Pin Mapping (Summary)
 
 | Channel | Button GPIO | LED GPIO | Default Group ID | Notes |
 |---------|-------------|----------|------------------|-------|
@@ -22,9 +31,13 @@ It issues Toggle commands (On/Off cluster, command 0x02) via the esp-matter clie
 
 All button inputs are active‑low (pressed = 0). LEDs are driven high to turn on.
 
-Constants are defined in `app_config.h` and can be overridden at compile time (e.g. via `-DLED_GPIO_0=GPIO_NUM_X`).
+Constants live in `app_config.h` and can be overridden at build time, e.g.:
+```
+idf.py build -DLED_GPIO_0=GPIO_NUM_5
+```
+More in `docs/hardware.md`.
 
-## Endpoint Layout
+## Endpoint Layout (Runtime)
 
 After commissioning, the node exposes endpoints in this order:
 
@@ -40,22 +53,20 @@ After commissioning, the node exposes endpoints in this order:
 
 (`g_onoff_endpoint_ids[]` holds endpoint IDs 1–4 at runtime; sensor endpoint IDs are stored in `g_temp_endpoint_id` & `g_humidity_endpoint_id`.)
 
-## Building & Flashing
-
-Standard ESP-IDF + esp-matter flow, eg:
+## Quick Build & Flash
 
 ```bash
 idf.py set-target esp32c6
 idf.py build flash monitor
 ```
 
-Make sure you have Thread / Wi‑Fi credentials set per your transport requirements before commissioning.
+Ensure `IDF_PATH` and `ESP_MATTER_PATH` are exported. Extended workflow (multi‑target, size, release profile, cleaning) lives in `docs/development.md`.
 
 ## Commissioning
 
-Use a Matter commissioner (e.g. `chip-tool` or a mobile app) to commission the controller. The setup payload / QR code output appears in the serial log on first boot or after factory reset.
+Use a Matter commissioner (`chip-tool` or mobile). Setup payload / QR appears on first boot or factory reset. Extra notes: `docs/development.md#commissioning`.
 
-## Binding & Group Control Instructions
+## Binding & Group Control
 
 Each switch endpoint (1–4) sends an OnOff Toggle to its bound targets. You can bind either:
 
@@ -64,7 +75,7 @@ Each switch endpoint (1–4) sends an OnOff Toggle to its bound targets. You can
 
 The Binding cluster (ID 0xF000) server lives on each switch endpoint (1–4). Its attribute `Binding` (ID 0x0000) is a list of binding entries. An entry can contain EITHER `{ group }` OR `{ node, endpoint, cluster }`.
 
-### Option A: Group Binding (Recommended for many lights)
+### Option A: Group Binding (Recommended)
 
 1. On each target light device, add it to the appropriate group (example for Group 0x0001 on endpoint 1 of target node 0x123456789ABCDEF):
    ```bash
@@ -91,7 +102,7 @@ The Binding cluster (ID 0xF000) server lives on each switch endpoint (1–4). It
 
 3. Press the physical button – the firmware will issue an OnOff Toggle to the group via the binding manager.
 
-### Option B: Unicast Binding (Single specific light)
+### Option B: Unicast Binding (Single Light)
 
 For a single target light with Node ID `<light-node-id>`, endpoint `<light-ep>` (which must host On/Off server cluster 0x0006):
 
@@ -118,7 +129,7 @@ You can mix group and unicast entries in the same list; each press iterates all 
 chip-tool binding write binding '[{"group":0x0002},{"node":0x123456789ABCDEF,"endpoint":1,"cluster":0x0006}]' <controller-node-id> 2
 ```
 
-### Verifying Bindings
+### Verify Bindings
 
 Read back the Binding list:
 
@@ -159,7 +170,7 @@ After reboot the shadow list is auto-loaded and logged; use `bind-list` to inspe
 
 To actually create operative bindings today, still perform standard Binding cluster writes (previous sections). The shadow facility is a staging / persistence aid only in this Option A build.
 
-### Clearing / Replacing Bindings
+### Clear / Replace Bindings
 
 Write an empty list (`[]`) to clear, or just write a new list to replace.
 
@@ -183,7 +194,7 @@ Temperature (endpoint 5) and Humidity (endpoint 6) periodically report measured 
 
 Use a standard Matter factory reset mechanism (e.g. long button hold if implemented, or `chip-tool` command). After clearing fabrics, the device reopens commissioning.
 
-## Future Enhancements (Planned / Optional)
+## Planned Enhancements
 
 * Remote On/Off state aggregation to illuminate LEDs if **any** bound targets are ON.
 * Persistent user-configurable group IDs via NVS.
@@ -196,11 +207,4 @@ Use a standard Matter factory reset mechanism (e.g. long button hold if implemen
 * Matter Specification (CSA) – Clusters: On/Off (0x0006), Binding (0xF000), Temperature Measurement (0x0402), Relative Humidity (0x0405)
 
 ---
-If you encounter issues with binding writes, ensure both controller and target devices share the same fabric and that target endpoints have the On/Off **server** cluster enabled.
-
-Provisioning notes (Light nodes 1 and 2, switch controller node 60):
-chip-tool binding write binding '[{"node":2,"endpoint":1,"cluster":6},{"node":1,"endpoint":1,"cluster":6}]' 60 1
-
-chip-tool accesscontrol write acl '[{"privilege":5,"authMode":2,"subjects":[112233],"targets":null},{"privilege":3,"authMode":2,"subjects":[60],"targets":null}]' 2 0
-
-chip-tool accesscontrol write acl '[{"privilege":5,"authMode":2,"subjects":[112233],"targets":null},{"privilege":3,"authMode":2,"subjects":[60],"targets":[{"cluster":6,"endpoint":1,"deviceType":null}]}]' 2 0
+Troubleshooting tips & verbose provisioning snippets moved to `docs/development.md#troubleshooting`.
