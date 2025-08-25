@@ -128,6 +128,42 @@ static void perform_deferred_binding_init() {
         if (s_shadow_lists[ch].count > 0) shadow_binding_commit(ch);
     }
     light_manager_sync_initial_state();
+    // Schedule periodic LED state re-sync while we do not yet have a subscription-based
+    // remote state tracker. This is lightweight (issues unicast reads similar to the
+    // boot-time sync). Design: one esp_timer periodic callback that schedules the work
+    // on the Matter thread to avoid heavy work on the timer task. Keep interval short
+    // (10s default) but configurable via LED_PERIODIC_SYNC_MS.
+    static esp_timer_handle_t s_led_periodic_sync_timer = nullptr;
+    if (!s_led_periodic_sync_timer) {
+        esp_timer_create_args_t args = {
+            .callback = [](void*){
+                chip::DeviceLayer::PlatformMgr().ScheduleWork(+[](intptr_t){
+                    // Re-enumerate live BindingTable to keep shadow lists in sync with any changes
+                    shadow_binding_refresh_from_table();
+                    // Optional debug: summarize counts so intermittent 'no bindings' can be diagnosed
+                    bool anyEmpty = false;
+                    for (int ch=0; ch<LIGHT_CHANNELS; ++ch) { if (s_shadow_lists[ch].count == 0) anyEmpty = true; }
+                    if (anyEmpty) {
+                        ESP_LOGD(TAG, "Periodic sync: channel binding counts: %d %d %d %d", 
+                                 (LIGHT_CHANNELS>0)?s_shadow_lists[0].count:0,
+                                 (LIGHT_CHANNELS>1)?s_shadow_lists[1].count:0,
+                                 (LIGHT_CHANNELS>2)?s_shadow_lists[2].count:0,
+                                 (LIGHT_CHANNELS>3)?s_shadow_lists[3].count:0);
+                    }
+                    light_manager_sync_initial_state();
+                });
+            },
+            .arg = nullptr,
+            .dispatch_method = ESP_TIMER_TASK,
+            .name = "led_sync"
+        };
+        if (esp_timer_create(&args, &s_led_periodic_sync_timer) == ESP_OK) {
+            esp_timer_start_periodic(s_led_periodic_sync_timer, (uint64_t)LED_PERIODIC_SYNC_MS * 1000ULL);
+            ESP_LOGI(TAG, "Scheduled periodic LED state sync every %u ms", (unsigned)LED_PERIODIC_SYNC_MS);
+        } else {
+            ESP_LOGW(TAG, "Failed to create periodic LED sync timer");
+        }
+    }
     s_shadow_bindings_committed = true;
 }
 

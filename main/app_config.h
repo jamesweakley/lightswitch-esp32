@@ -62,3 +62,10 @@
 // Debounce parameters
 #define BUTTON_POLL_MS    20
 #define BUTTON_STABLE_CNT 3   // 3*20ms = ~60ms debounce
+
+// Periodic LED state resync interval (ms). The initial implementation performed
+// a single sync ~10s after boot; now we repeat every 10s until proper
+// subscription-based tracking is implemented. Guarded for override.
+#ifndef LED_PERIODIC_SYNC_MS
+#define LED_PERIODIC_SYNC_MS 10000
+#endif

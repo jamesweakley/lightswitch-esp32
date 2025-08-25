@@ -50,6 +50,9 @@ volatile uint32_t g_last_press_tick = 0;
 // --- State & GPIO mappings (restored) ---
 static bool s_led_any_on[LIGHT_CHANNELS] = {false};
 static uint8_t s_on_count[LIGHT_CHANNELS] = {0};
+// Periodic resync round tracking
+static uint8_t s_pending_read_counts[LIGHT_CHANNELS] = {0};
+static bool s_round_any_on[LIGHT_CHANNELS] = {false};
 
 static const gpio_num_t s_button_gpios[LIGHT_CHANNELS] = { BUTTON_GPIO_0, BUTTON_GPIO_1, BUTTON_GPIO_2, BUTTON_GPIO_3 };
 static const gpio_num_t s_led_gpios[LIGHT_CHANNELS]    = { LED_GPIO_0, LED_GPIO_1, LED_GPIO_2, LED_GPIO_3 };
@@ -151,22 +154,12 @@ public:
         bool on = false;
         if (data && data->Get(on) == CHIP_NO_ERROR) {
             mGotAttribute = true;
-            bool prevAggregate = s_led_any_on[mChannel];
-            bool ledChanged = false;
+            // Aggregation semantics: LED ON if ANY bound target reports ON in this round.
             if (on) {
-                if (!prevAggregate) { s_led_any_on[mChannel] = true; ledChanged = true; }
-            } else {
-                // OFF only matters if no other target reported ON yet (aggregate semantics: ANY target ON -> LED ON)
-                if (!prevAggregate) { s_led_any_on[mChannel] = false; ledChanged = false; }
+                s_round_any_on[mChannel] = true;
+                if (!s_led_any_on[mChannel]) { s_led_any_on[mChannel] = true; apply_led(mChannel, true); }
             }
-            apply_led(mChannel, s_led_any_on[mChannel]);
-            ESP_LOGI(TAG,
-                     "CH%u: initial read ep=%u OnOff=%s -> aggregate=%s (LED %s)",
-                     mChannel,
-                     (unsigned)path.mEndpointId,
-                     on?"ON":"OFF",
-                     s_led_any_on[mChannel]?"ON":"OFF",
-                     ledChanged? (s_led_any_on[mChannel]?"turned ON":"turned OFF") : "unchanged");
+            ESP_LOGI(TAG, "CH%u: read ep=%u OnOff=%s (round_any_on=%s pending=%u)", mChannel, (unsigned)path.mEndpointId, on?"ON":"OFF", s_round_any_on[mChannel]?"YES":"NO", (unsigned)s_pending_read_counts[mChannel]);
         } else {
             ESP_LOGW(TAG, "CH%u: failed to decode initial OnOff TLV", mChannel);
         }
@@ -174,6 +167,18 @@ public:
     void OnDone(chip::app::ReadClient * client) override {
         if (!mGotAttribute) {
             ESP_LOGI(TAG, "CH%u: initial read completed with no OnOff attribute report", mChannel);
+        }
+        if (s_pending_read_counts[mChannel] > 0) {
+            s_pending_read_counts[mChannel]--;
+            if (s_pending_read_counts[mChannel] == 0) {
+                // All scheduled reads for this channel finished. If none were ON, turn LED OFF.
+                if (!s_round_any_on[mChannel] && s_led_any_on[mChannel]) {
+                    s_led_any_on[mChannel] = false; apply_led(mChannel, false);
+                    ESP_LOGI(TAG, "CH%u: aggregate OFF after reads", mChannel);
+                } else if (s_round_any_on[mChannel]) {
+                    ESP_LOGD(TAG, "CH%u: aggregate remains ON (one or more targets ON)", mChannel);
+                }
+            }
         }
         if (client) chip::Platform::Delete(client);
         chip::Platform::Delete(this);
@@ -191,7 +196,8 @@ private:
 struct SessionCtx { uint8_t ch; chip::EndpointId ep; };
 
     struct PendingInitialRead { uint8_t ch; uint64_t node; chip::EndpointId ep; uint8_t fabric_index; };
-    static PendingInitialRead s_pending_reads[LIGHT_CHANNELS];
+    // Allow scheduling all unicast bindings each round (worst case: LIGHT_CHANNELS * MAX_SHADOW_BINDINGS_PER_CH)
+    static PendingInitialRead s_pending_reads[LIGHT_CHANNELS * MAX_SHADOW_BINDINGS_PER_CH];
     static int s_pending_count = 0;
 
     static void send_initial_read(const PendingInitialRead & item) {
@@ -239,8 +245,14 @@ struct SessionCtx { uint8_t ch; chip::EndpointId ep; };
 
     static void schedule_single_initial_read(uint8_t ch, const ShadowBindingEntry & entry, uint32_t delay_ms) {
         if (entry.is_group) return;
-        if (s_pending_count >= (int)(sizeof(s_pending_reads)/sizeof(s_pending_reads[0]))) return;
-    s_pending_reads[s_pending_count++] = PendingInitialRead{ch, entry.node_id, (chip::EndpointId)entry.endpoint, entry.fabric_index};
+        if (s_pending_count >= (int)(sizeof(s_pending_reads)/sizeof(s_pending_reads[0]))) {
+            ESP_LOGW(TAG, "Pending read array full; skipping additional schedules this round");
+            return;
+        }
+        s_pending_reads[s_pending_count++] = PendingInitialRead{ch, entry.node_id, (chip::EndpointId)entry.endpoint, entry.fabric_index};
+        if (ch < LIGHT_CHANNELS) {
+            s_pending_read_counts[ch]++;
+        }
         // Use a one-shot timer to allow staggered start and give DNS-SD time.
         struct TimerCtx { PendingInitialRead item; };
         auto * tctx = chip::Platform::New<TimerCtx>(); if (!tctx) return; tctx->item = s_pending_reads[s_pending_count-1];
@@ -257,14 +269,19 @@ struct SessionCtx { uint8_t ch; chip::EndpointId ep; };
 } // anonymous namespace
 
 void light_manager_sync_initial_state() {
-    // Baseline: assume OFF; will OR-in any ON from responses
-    for (int ch = 0; ch < LIGHT_CHANNELS; ch++) { s_led_any_on[ch] = false; apply_led(ch, false); }
-    // NOTE: Previously skipped small node IDs; re-enabled reads to recover LED state even if node IDs look small.
-    // To cap timeout impact, only schedule the first unicast per channel for now.
-    // Schedule reads per unicast binding
+    // Skip starting a new round if prior reads still pending (avoid overlapping aggregation).
+    bool any_pending=false; for (int ch=0; ch<LIGHT_CHANNELS; ++ch) if (s_pending_read_counts[ch] != 0) { any_pending=true; break; }
+    if (any_pending) { ESP_LOGD(TAG, "Skip sync: reads still pending"); return; }
+    // Reset aggregation flags and pending list index for fresh round; preserve current LED display until results arrive.
+    for (int ch = 0; ch < LIGHT_CHANNELS; ch++) { s_round_any_on[ch] = false; s_pending_read_counts[ch] = 0; }
+    s_pending_count = 0;
+    // Schedule unicast reads per channel (if any). If a channel has no bindings, leave LED unchanged.
     for (int ch = 0; ch < LIGHT_CHANNELS; ch++) {
         auto * list = shadow_binding_get_list(ch);
-        if (!list || list->count == 0) { ESP_LOGI(TAG, "CH%u: no bindings; skip initial read", ch); continue; }
+        if (!list || list->count == 0) {
+            ESP_LOGI(TAG, "CH%u: no bindings; skip read (LED stays %s)", ch, s_led_any_on[ch]?"ON":"OFF");
+            continue;
+        }
         bool any=false;
         for (int i=0;i<list->count;i++) {
             const auto & e = list->entries[i];
@@ -272,9 +289,10 @@ void light_manager_sync_initial_state() {
             any = true;
             schedule_single_initial_read(ch, e, 0);
         }
-        if (!any) ESP_LOGI(TAG, "CH%u: only group bindings; skip initial read", ch);
+        if (!any) {
+            ESP_LOGI(TAG, "CH%u: only group bindings; skip unicast read (LED stays %s)", ch, s_led_any_on[ch]?"ON":"OFF");
+        }
     }
-    // Nothing else to do; timers will fire and schedule reads.
 }
 
 // ---- Button press handling ----
