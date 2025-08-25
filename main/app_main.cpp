@@ -25,6 +25,8 @@
 #include <app-common/zap-generated/cluster-objects.h>
 // TLV utilities (header name differs across versions: prefer TLV.h)
 #include <lib/core/TLV.h>
+// For direct BindingTable enumeration (controller shadow import). Header name is app/util/binding-table.h
+#include "app/util/binding-table.h"
 
 #include <common_macros.h>
 #include <app_priv.h>
@@ -60,20 +62,74 @@ static esp_timer_handle_t init_watchdog_timer = NULL;
 static bool matter_started = false;
 
 // ---- Shadow Binding Structures ----
-struct ShadowBindingEntry {
-    bool is_group; // false = unicast
-    uint64_t node_id;
-    uint16_t endpoint;
-    uint32_t cluster_id; // typically 0x0006
-    uint16_t group_id;   // valid if is_group
-};
-
-static constexpr int MAX_SHADOW_BINDINGS_PER_CH = 10;
-struct ShadowBindingList {
-    int count;
-    ShadowBindingEntry entries[MAX_SHADOW_BINDINGS_PER_CH];
-};
+// Definitions now centralized in light_manager.h to avoid duplicate typedefs.
 static ShadowBindingList s_shadow_lists[LIGHT_CHANNELS];
+// Track whether we've committed restored shadow bindings yet (delay until network up to avoid early CASE attempts)
+static bool s_shadow_bindings_committed = false;
+static bool s_ip_event_seen = false;
+static esp_timer_handle_t s_deferred_commit_timer = nullptr;
+static esp_timer_handle_t s_fallback_commit_timer = nullptr; // fallback if no IP/Thread event
+static bool s_commit_timer_started = false;
+
+// Forward for refresh helper
+static void shadow_binding_refresh_from_table();
+
+// Forward declare helpers used by commit
+static void shadow_binding_log(int ch);
+static esp_err_t shadow_binding_save_nvs(int ch);
+// Commit implementation placed early so later callbacks can call it without forward decl
+static esp_err_t shadow_binding_commit_impl(int ch) {
+    if (ch < 0 || ch >= LIGHT_CHANNELS) return ESP_ERR_INVALID_ARG;
+    uint16_t ep = g_onoff_endpoint_ids[ch];
+    ESP_LOGI(TAG, "Committing shadow bindings (Option C external writes) -> ep %u entries=%d", ep, s_shadow_lists[ch].count);
+    shadow_binding_log(ch);
+    shadow_binding_save_nvs(ch);
+    return ESP_OK;
+}
+
+#define shadow_binding_commit(ch) shadow_binding_commit_impl(ch)
+
+#ifndef BINDING_COMMIT_DELAY_MS
+#define BINDING_COMMIT_DELAY_MS 10000 // Increased to 10s to allow network to stabilize before binding init & LED sync
+#endif
+
+static void perform_deferred_binding_init();
+static void deferred_commit_timer_cb(void *arg) {
+    if (s_shadow_bindings_committed) return;
+    ESP_LOGI(TAG, "Deferred commit timer fired: scheduling binding manager init & LED sync on Matter thread");
+    chip::DeviceLayer::PlatformMgr().ScheduleWork(+[](intptr_t){ perform_deferred_binding_init(); });
+}
+
+static void schedule_binding_commit_timer(const char * reason) {
+    if (s_commit_timer_started || s_shadow_bindings_committed) {
+        ESP_LOGD(TAG, "Commit timer already started or committed (reason=%s)", reason);
+        return;
+    }
+    esp_timer_create_args_t targs = { .callback = &deferred_commit_timer_cb, .arg = nullptr, .dispatch_method = ESP_TIMER_TASK, .name = "bind_commit" };
+    if (esp_timer_create(&targs, &s_deferred_commit_timer) == ESP_OK) {
+        uint64_t delay_us = (uint64_t)BINDING_COMMIT_DELAY_MS * 1000ULL;
+        esp_timer_start_once(s_deferred_commit_timer, delay_us);
+        s_commit_timer_started = true;
+        uint64_t now = esp_timer_get_time();
+        ESP_LOGI(TAG, "Scheduled shadow binding commit in %d ms (reason=%s, now=%llu us)", BINDING_COMMIT_DELAY_MS, reason, (unsigned long long)now);
+    } else {
+        ESP_LOGE(TAG, "Failed to create deferred commit timer (reason=%s)", reason);
+    }
+}
+
+static void perform_deferred_binding_init() {
+    if (s_shadow_bindings_committed) return;
+    uint64_t now = esp_timer_get_time();
+    ESP_LOGI(TAG, "Initializing binding manager & committing shadow bindings now (t=%llu ms since boot)", (unsigned long long)(now/1000));
+    esp_matter::client::binding_manager_init();
+    // Import live BindingTable entries into our shadow lists before committing & syncing LEDs
+    shadow_binding_refresh_from_table();
+    for (int ch = 0; ch < LIGHT_CHANNELS; ch++) {
+        if (s_shadow_lists[ch].count > 0) shadow_binding_commit(ch);
+    }
+    light_manager_sync_initial_state();
+    s_shadow_bindings_committed = true;
+}
 
 // Lightweight accessor so other compilation units (light_manager) can iterate shadow entries for unicast.
 extern "C" const ShadowBindingList * shadow_binding_get_list(int ch) {
@@ -145,92 +201,51 @@ static void shadow_binding_log(int ch) {
     }
 }
 
-static esp_err_t shadow_binding_add_unicast(int ch, uint64_t node_id, uint16_t endpoint, uint32_t cluster_id) {
-    if (ch < 0 || ch >= LIGHT_CHANNELS) return ESP_ERR_INVALID_ARG;
-    auto &list = s_shadow_lists[ch];
-    // Dedup
-    for (int i = 0; i < list.count; i++) {
-        auto &e = list.entries[i];
-        if (!e.is_group && e.node_id == node_id && e.endpoint == endpoint && e.cluster_id == cluster_id) {
-            ESP_LOGI(TAG, "Shadow binding already present");
-            return ESP_OK;
+// Enumerate CHIP BindingTable and rebuild per-channel shadow lists.
+static void shadow_binding_refresh_from_table() {
+    // Reset counts
+    for (int ch=0; ch<LIGHT_CHANNELS; ++ch) { s_shadow_lists[ch].count = 0; }
+    auto & table = chip::BindingTable::GetInstance();
+    ESP_LOGI(TAG, "Enumerating BindingTable (size=%u)", (unsigned)table.Size());
+    // Simple per-channel de-dup (node,ep,cluster) to avoid duplicate scheduling later.
+    struct Key { uint64_t node; uint16_t ep; uint32_t cluster; bool operator==(const Key &o) const { return node==o.node && ep==o.ep && cluster==o.cluster; } };
+    for (auto iter = table.begin(); iter != table.end(); ++iter) {
+        const EmberBindingTableEntry & e = *iter;
+        if (!e.type) continue; // empty slot
+        chip::EndpointId localEp = e.local;
+        int chIndex = -1;
+        for (int ch=0; ch<LIGHT_CHANNELS; ++ch) { if (g_onoff_endpoint_ids[ch] == localEp) { chIndex = ch; break; } }
+        if (chIndex < 0) continue; // not our on/off endpoints
+        constexpr uint8_t kMulticast = MATTER_MULTICAST_BINDING;
+        constexpr uint8_t kUnicast   = MATTER_UNICAST_BINDING;
+        uint32_t cluster_id = e.clusterId.has_value() ? static_cast<uint32_t>(*e.clusterId) : 0;
+        if (e.type == kUnicast) {
+            uint64_t node_id = e.nodeId; // verify looks like an operational node id (random > small fabric indexes)
+            if (node_id <= 0xFFFFULL) {
+                ESP_LOGW(TAG, "Binding entry with suspicious small node id=0x%" PRIX64 " (raw). Will still add.", node_id);
+            }
+            // De-dup check
+            bool dup=false; for (int i=0;i<s_shadow_lists[chIndex].count;i++){ auto &sb = s_shadow_lists[chIndex].entries[i]; if(!sb.is_group && sb.node_id==node_id && sb.endpoint==e.remote && sb.cluster_id==cluster_id){ dup=true; break; } }
+            if (dup) { ESP_LOGI(TAG, "Skip duplicate unicast binding ch%u node=0x%016" PRIX64 " ep=%u cl=0x%04X", chIndex, (uint64_t)node_id, (unsigned)e.remote, (unsigned)cluster_id); continue; }
+            if (s_shadow_lists[chIndex].count >= MAX_SHADOW_BINDINGS_PER_CH) { ESP_LOGW(TAG, "Shadow list full ch%u (max=%d)", chIndex, MAX_SHADOW_BINDINGS_PER_CH); continue; }
+            auto & dst = s_shadow_lists[chIndex].entries[s_shadow_lists[chIndex].count++];
+            dst.is_group=false; dst.node_id=node_id; dst.endpoint=e.remote; dst.cluster_id=cluster_id; dst.group_id=0; dst.fabric_index = e.fabricIndex;
+            ESP_LOGI(TAG, "Added UNICAST ch%u node=0x%016" PRIX64 " ep=%u cl=0x%04X", chIndex, (uint64_t)node_id, (unsigned)e.remote, (unsigned)cluster_id);
+        } else if (e.type == kMulticast) {
+            if (s_shadow_lists[chIndex].count >= MAX_SHADOW_BINDINGS_PER_CH) { ESP_LOGW(TAG, "Shadow list full ch%u (max=%d)", chIndex, MAX_SHADOW_BINDINGS_PER_CH); continue; }
+            auto & dst = s_shadow_lists[chIndex].entries[s_shadow_lists[chIndex].count++];
+            dst.is_group=true; dst.group_id = e.groupId; dst.cluster_id=cluster_id; dst.node_id=0; dst.endpoint=0; dst.fabric_index=e.fabricIndex;
+            ESP_LOGI(TAG, "Added GROUP ch%u group=0x%04X cl=0x%04X", chIndex, (unsigned)e.groupId, (unsigned)cluster_id);
+        } else {
+            ESP_LOGI(TAG, "Skip unsupported binding type=%u localEp=%u", (unsigned)e.type, (unsigned)localEp);
         }
     }
-    if (list.count >= MAX_SHADOW_BINDINGS_PER_CH) return ESP_ERR_NO_MEM;
-    auto &e = list.entries[list.count++];
-    e.is_group = false; e.node_id = node_id; e.endpoint = endpoint; e.cluster_id = cluster_id; e.group_id = 0;
-    return ESP_OK;
+    for (int ch=0; ch<LIGHT_CHANNELS; ++ch) { if (s_shadow_lists[ch].count > 0) shadow_binding_log(ch); }
 }
 
-// Rewrites Binding attribute with combined existing (shadow) + new entry.
-static esp_err_t shadow_binding_commit(int ch) {
-    if (ch < 0 || ch >= LIGHT_CHANNELS) return ESP_ERR_INVALID_ARG;
-    uint16_t ep = g_onoff_endpoint_ids[ch];
-    ESP_LOGI(TAG, "Committing shadow bindings (Option C external writes) -> ep %u entries=%d", ep, s_shadow_lists[ch].count);
-    shadow_binding_log(ch);
-    // Persist shadow
-    shadow_binding_save_nvs(ch);
-    return ESP_OK;
-}
+// shadow_binding_add_unicast removed (console commands disabled); add later if interactive add required.
 
-// Console command to add unicast binding: bind-add <channel> <node_id_hex> <endpoint> [cluster=0x0006]
-static int cmd_bind_add(int argc, char **argv) {
-    if (argc < 4) {
-        printf("Usage: bind-add <channel 0-%d> <node-id-hex> <endpoint> [cluster-hex]\n", LIGHT_CHANNELS-1);
-        return 0;
-    }
-    int ch = atoi(argv[1]);
-    uint64_t node_id = strtoull(argv[2], nullptr, 16);
-    uint16_t ep = (uint16_t)strtoul(argv[3], nullptr, 0);
-    uint32_t cluster = 0x0006;
-    if (argc > 4) cluster = (uint32_t)strtoul(argv[4], nullptr, 16);
-    if (shadow_binding_add_unicast(ch, node_id, ep, cluster) == ESP_OK) {
-        shadow_binding_commit(ch);
-    }
-    return 0;
-}
-
-// bind-list [ch]
-static int cmd_bind_list(int argc, char **argv) {
-    if (argc == 1) {
-        for (int ch = 0; ch < LIGHT_CHANNELS; ch++) shadow_binding_log(ch);
-        return 0;
-    }
-    int ch = atoi(argv[1]);
-    shadow_binding_log(ch);
-    return 0;
-}
-
-// bind-remove <ch> <index>
-static int cmd_bind_remove(int argc, char **argv) {
-    if (argc < 3) { printf("Usage: bind-remove <channel> <index>\n"); return 0; }
-    int ch = atoi(argv[1]);
-    int idx = atoi(argv[2]);
-    if (ch < 0 || ch >= LIGHT_CHANNELS) return 0;
-    auto &list = s_shadow_lists[ch];
-    if (idx < 0 || idx >= list.count) { printf("Index out of range\n"); return 0; }
-    for (int i = idx; i < list.count - 1; i++) list.entries[i] = list.entries[i+1];
-    list.count--;
-    shadow_binding_commit(ch);
-    return 0;
-}
-
-// bind-clear <ch>
-static int cmd_bind_clear(int argc, char **argv) {
-    if (argc < 2) { printf("Usage: bind-clear <channel>\n"); return 0; }
-    int ch = atoi(argv[1]);
-    shadow_binding_clear_channel(ch);
-    shadow_binding_commit(ch);
-    return 0;
-}
-
-// bind-commit <ch>
-static int cmd_bind_commit(int argc, char **argv) {
-    if (argc < 2) { printf("Usage: bind-commit <channel>\n"); return 0; }
-    int ch = atoi(argv[1]);
-    shadow_binding_commit(ch);
-    return 0;
-}
+// (Console binding commands removed to simplify build and suppress unused warnings.)
 
 static void init_watchdog_callback(void* arg)
 {
@@ -264,6 +279,7 @@ static void app_event_cb(const ChipDeviceEvent *event, intptr_t arg)
     switch (event->Type) {
     case chip::DeviceLayer::DeviceEventType::kInterfaceIpAddressChanged:
         ESP_LOGI(TAG, "Interface IP Address changed");
+        if (!s_ip_event_seen) { s_ip_event_seen = true; schedule_binding_commit_timer("ip_addr_changed"); }
         break;
 
     case chip::DeviceLayer::DeviceEventType::kCommissioningComplete:
@@ -368,10 +384,12 @@ static void app_event_cb(const ChipDeviceEvent *event, intptr_t arg)
     // Thread/OpenThread events
     case chip::DeviceLayer::DeviceEventType::kThreadConnectivityChange:
         ESP_LOGI(TAG, "Thread connectivity changed");
+        if (!s_commit_timer_started) schedule_binding_commit_timer("thread_connectivity");
         break;
         
     case chip::DeviceLayer::DeviceEventType::kThreadStateChange:
         ESP_LOGI(TAG, "Thread state changed");
+        if (!s_commit_timer_started) schedule_binding_commit_timer("thread_state");
         break;
         
     // Add error handling for connectivity issues
@@ -418,17 +436,13 @@ static esp_err_t app_attribute_update_cb(attribute::callback_type_t type, uint16
         if (type == attribute::PRE_UPDATE) {
             ESP_LOGI(TAG, "Binding PRE_UPDATE ep=%u (incoming list replaces shadow)", endpoint_id);
         } else if (type == attribute::POST_UPDATE) {
-            ESP_LOGI(TAG, "Binding POST_UPDATE ep=%u (shadow invalidated -> mark dirty)", endpoint_id);
-            // Mark shadow dirty so next 'add' command will rebuild from NVS or assume empty.
-            // (Simplified: we just clear it.)
-            for (int ch = 0; ch < LIGHT_CHANNELS; ch++) {
-                if (g_onoff_endpoint_ids[ch] == endpoint_id) {
-                    // Clear shadow entry count (defined later) via extern helper
-                    extern void shadow_binding_clear_channel(int ch);
-                    shadow_binding_clear_channel(ch);
-                    break;
-                }
-            }
+            ESP_LOGI(TAG, "Binding POST_UPDATE ep=%u (refresh shadow from live table)", endpoint_id);
+            // Re-import asynchronously on Matter thread to avoid doing table ops in attribute callback context
+            chip::DeviceLayer::PlatformMgr().ScheduleWork(+[](intptr_t){
+                shadow_binding_refresh_from_table();
+                // Persist & optionally retrigger initial sync logic (does not harm if repeated)
+                for (int ch=0; ch<LIGHT_CHANNELS; ++ch) { if (s_shadow_lists[ch].count > 0) shadow_binding_commit(ch); }
+            });
         }
         return err;
     }
@@ -607,9 +621,7 @@ extern "C" void app_main()
     /* Matter start */
     err = esp_matter::start(app_event_cb);
     ABORT_APP_ON_FAILURE(err == ESP_OK, ESP_LOGE(TAG, "Failed to start Matter, err:%d", err));
-    // Initialize binding manager
-    esp_matter::client::binding_manager_init();
-    // Install a minimal request callback to actually send Toggle for unicast bindings (esp-matter client does not auto-send)
+    // Request callback for Toggle commands (binding manager init deferred until network ready)
     esp_matter::client::set_request_callback(
         [](chip::DeviceProxy * device, esp_matter::client::request_handle * req, void *){
             if (!device || !req) return;
@@ -651,9 +663,8 @@ extern "C" void app_main()
         },
         [](uint8_t, esp_matter::client::request_handle *, void *){}, nullptr);
     // Commit any restored shadow bindings to live Binding attribute (placeholder writer)
-    for (int ch = 0; ch < LIGHT_CHANNELS; ch++) {
-        if (s_shadow_lists[ch].count > 0) shadow_binding_commit(ch);
-    }
+    // Defer committing & LED sync until post-IP delay (handled in app_event_cb)
+    ESP_LOGI(TAG, "Deferring shadow binding commit & LED sync until IP event + %d ms", BINDING_COMMIT_DELAY_MS);
 
     // Periodic instrumentation log (every 30s) for request callback counters
     static esp_timer_handle_t reqcb_timer;
