@@ -10,5 +10,11 @@
   ],
   "idf.customExtraVars": {
     "IDF_TARGET": "esp32c6"
+  },
+  "files.associations": {
+    "array": "cpp",
+    "string": "cpp",
+    "string_view": "cpp",
+    "vector": "cpp"
   }
 }

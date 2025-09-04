@@ -53,7 +53,7 @@ Defined in `app_config.h` with macro overrides for:
 Override via CMake cache defines: `idf.py build -DGROUP_ID_0=0x0100`.
 
 ## DHT22 Implementation Status
-Currently a stub (`dht22_read()` always returns false). Add a robust driver (timing critical) or replace with a different sensor; then call `report_temperature()` / `report_humidity()` with scaled values (0.01 units).
+Implemented minimal bit‑banged driver (timing‑sensitive) with 10s cadence. Values are read in 0.1 units and scaled to 0.01 for Matter `MeasuredValue` attributes on Temperature (0x0402) and Relative Humidity (0x0405) clusters. Failures are logged (checksum / timeout) and transient; a streak counter emits warnings at 3 and every 10 thereafter. Replace with a hardware‑timer or RMT based implementation for higher robustness if needed.
 
 ## Power & Watchdog
 * Optional PM lock prevents light sleep (JTAG stability).

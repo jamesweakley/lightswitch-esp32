@@ -1,368 +1,65 @@
-/*
- * Light manager for 1-4 on/off channels and DHT22 sensor.
- *
- * Responsibilities:
- *  - GPIO init (buttons + LEDs)
- *  - Button polling & dispatch of Toggle commands via esp-matter binding manager
- *  - Brief LED blink feedback on press
- *  - Boot-time initial remote OnOff attribute read (Phase 1) after bindings committed
- */
-
+/* Clean replacement file (corruption fixed). */
 #include "light_manager.h"
-
 #include <esp_log.h>
-#include <string.h>
-#include <memory>
 #include <driver/gpio.h>
 #include <esp_timer.h>
-#include "esp_rom_sys.h"
 #include "freertos/queue.h"
-#include <platform/PlatformManager.h>
-
-#include <inttypes.h>
-
-#include <esp_matter.h>
-// Client API for bindings and group/unicast requests
-#include <esp_matter_client.h>
-// CHIP cluster ids & command ids
-#include <app-common/zap-generated/cluster-objects.h>
-#include <app/CommandPathParams.h>
-#include <app/InteractionModelEngine.h>
 #include <app/ReadClient.h>
-// For fabric table, CASE session manager
+#include <app/InteractionModelEngine.h>
 #include <app/server/Server.h>
-#include <protocols/secure_channel/SessionEstablishmentDelegate.h>
+#include <esp_matter.h>
+#include "../temp/temp_manager.h"  // sensor task now lives in temp module
+#include <esp_matter_client.h>
+#include <platform/PlatformManager.h>
 #include <lib/core/ScopedNodeId.h>
-
-// (Binding table internal CHIP headers not included in esp-matter public API; detailed per-target logging limited.)
-// Subscription for continuous remote state tracking is a future phase (not yet implemented).
 
 using namespace esp_matter;
 using namespace esp_matter::attribute;
 
-// Logging tag
-static const char *TAG = "light_manager";
-// Track last button press tick for latency diagnostics
+static const char * TAG = "light_manager";
 volatile uint32_t g_last_press_tick = 0;
 
-// static void subscriptions_init() { }
+extern uint16_t g_onoff_endpoint_ids[LIGHT_CHANNELS];
+extern const ShadowBindingList * shadow_binding_get_list(int ch);
+extern "C" void temp_manager_start();
 
-// --- State & GPIO mappings (restored) ---
 static bool s_led_any_on[LIGHT_CHANNELS] = {false};
-static uint8_t s_on_count[LIGHT_CHANNELS] = {0};
-// Periodic resync round tracking
 static uint8_t s_pending_read_counts[LIGHT_CHANNELS] = {0};
 static bool s_round_any_on[LIGHT_CHANNELS] = {false};
-
 static const gpio_num_t s_button_gpios[LIGHT_CHANNELS] = { BUTTON_GPIO_0, BUTTON_GPIO_1, BUTTON_GPIO_2, BUTTON_GPIO_3 };
 static const gpio_num_t s_led_gpios[LIGHT_CHANNELS]    = { LED_GPIO_0, LED_GPIO_1, LED_GPIO_2, LED_GPIO_3 };
-
-// Public endpoint IDs (defined in app_main)
-extern uint16_t g_onoff_endpoint_ids[LIGHT_CHANNELS];
-
-// Button polling task handle
-static TaskHandle_t s_button_task = nullptr;      // polling task (lightweight)
-static TaskHandle_t s_button_act_task = nullptr;  // action task (does logging & Matter calls)
-// static TaskHandle_t s_dht_task = nullptr; // future sensor task
-static QueueHandle_t s_button_evt_queue = nullptr; // queue of uint8_t channel indices
-
-// LED blink timers (one-shot) to avoid blocking delays on button tasks
+static TaskHandle_t s_button_task = nullptr;
+static TaskHandle_t s_button_act_task = nullptr;
+static QueueHandle_t s_button_evt_queue = nullptr;
 static esp_timer_handle_t s_led_blink_timers[LIGHT_CHANNELS] = {nullptr};
 
-// Forward declare
-static void send_group_toggle(uint8_t ch);
+static void apply_led(uint8_t ch, bool on){ if (ch < LIGHT_CHANNELS) gpio_set_level(s_led_gpios[ch], on?1:0); }
+bool light_manager_get(uint8_t ch){ return (ch<LIGHT_CHANNELS)? s_led_any_on[ch]: false; }
 
-static void apply_led(uint8_t ch, bool on)
-{
-    if (ch >= LIGHT_CHANNELS) return;
-    gpio_set_level(s_led_gpios[ch], on ? 1 : 0);
-}
+static void buttons_init(){ gpio_config_t in_cfg={}; in_cfg.intr_type=GPIO_INTR_DISABLE; in_cfg.mode=GPIO_MODE_INPUT; in_cfg.pull_down_en=GPIO_PULLDOWN_DISABLE; in_cfg.pull_up_en=GPIO_PULLUP_ENABLE; for(int i=0;i<LIGHT_CHANNELS;i++){ if (s_button_gpios[i]==GPIO_NUM_NC) continue; in_cfg.pin_bit_mask=(1ULL<<s_button_gpios[i]); gpio_config(&in_cfg); gpio_set_pull_mode(s_button_gpios[i], GPIO_PULLUP_ONLY);} }
+static void leds_init(){ gpio_config_t out_cfg={}; out_cfg.intr_type=GPIO_INTR_DISABLE; out_cfg.mode=GPIO_MODE_OUTPUT; for(int i=0;i<LIGHT_CHANNELS;i++){ if (s_led_gpios[i]==GPIO_NUM_NC) continue; out_cfg.pin_bit_mask=(1ULL<<s_led_gpios[i]); gpio_config(&out_cfg); gpio_set_level(s_led_gpios[i],0);} }
 
-bool light_manager_get(uint8_t channel) {
-    if (channel >= LIGHT_CHANNELS) {
-        return false;
-    }
-    return s_led_any_on[channel];
-}
+static void button_task(void*){ uint8_t stable[LIGHT_CHANNELS]={0}; uint8_t last[LIGHT_CHANNELS]={1,1,1,1}; while(true){ for(int i=0;i<LIGHT_CHANNELS;i++){ int lvl=gpio_get_level(s_button_gpios[i]); if(lvl==last[i]){ if(stable[i]<255) stable[i]++; } else { stable[i]=0; last[i]=lvl; } if(last[i]==0 && stable[i]==BUTTON_STABLE_CNT){ uint8_t ch=i; if(s_button_evt_queue) xQueueSend(s_button_evt_queue,&ch,0); } } vTaskDelay(pdMS_TO_TICKS(BUTTON_POLL_MS)); } }
+static void led_blink_timer_cb(void* arg){ uint32_t ch=(uint32_t)arg; if(ch<LIGHT_CHANNELS) apply_led(ch, s_led_any_on[ch]); }
 
-static void buttons_init()
-{
-    gpio_config_t in_cfg = {};
-    in_cfg.intr_type = GPIO_INTR_DISABLE;
-    in_cfg.mode = GPIO_MODE_INPUT;
-    in_cfg.pull_down_en = GPIO_PULLDOWN_DISABLE;
-    in_cfg.pull_up_en = GPIO_PULLUP_ENABLE;
-    for (int i = 0; i < LIGHT_CHANNELS; i++) {
-        if (s_button_gpios[i] == GPIO_NUM_NC) continue;
-        in_cfg.pin_bit_mask = (1ULL << s_button_gpios[i]);
-        gpio_config(&in_cfg);
-        gpio_set_pull_mode(s_button_gpios[i], GPIO_PULLUP_ONLY);
-    }
-}
+class InitialReadCallback : public chip::app::ReadClient::Callback { public: explicit InitialReadCallback(uint8_t c):mCh(c){} void OnReportBegin() override {mGot=false;} void OnAttributeData(const chip::app::ConcreteDataAttributePath & path, chip::TLV::TLVReader * data,const chip::app::StatusIB & status) override { if(status.mStatus!=chip::Protocols::InteractionModel::Status::Success) return; if(path.mClusterId!=chip::app::Clusters::OnOff::Id || path.mAttributeId!=chip::app::Clusters::OnOff::Attributes::OnOff::Id) return; bool on=false; if(data && data->Get(on)==CHIP_NO_ERROR){ mGot=true; if(on){ s_round_any_on[mCh]=true; if(!s_led_any_on[mCh]){ s_led_any_on[mCh]=true; apply_led(mCh,true);} } } } void OnDone(chip::app::ReadClient * c) override { if (s_pending_read_counts[mCh]>0){ s_pending_read_counts[mCh]--; if(s_pending_read_counts[mCh]==0 && !s_round_any_on[mCh] && s_led_any_on[mCh]) { s_led_any_on[mCh]=false; apply_led(mCh,false);} } if(c) chip::Platform::Delete(c); chip::Platform::Delete(this);} void OnError(CHIP_ERROR err) override { ESP_LOGW(TAG,"CH%u read error %" CHIP_ERROR_FORMAT,mCh,err.Format()); } void OnReportEnd() override {} void OnSubscriptionEstablished(chip::SubscriptionId) override {} private: uint8_t mCh; bool mGot=false; };
 
-static void leds_init()
-{
-    gpio_config_t out_cfg = {};
-    out_cfg.intr_type = GPIO_INTR_DISABLE;
-    out_cfg.mode = GPIO_MODE_OUTPUT;
-    out_cfg.pull_down_en = GPIO_PULLDOWN_DISABLE;
-    out_cfg.pull_up_en = GPIO_PULLUP_DISABLE;
-    for (int i = 0; i < LIGHT_CHANNELS; i++) {
-        if (s_led_gpios[i] == GPIO_NUM_NC) continue;
-        out_cfg.pin_bit_mask = (1ULL << s_led_gpios[i]);
-        gpio_config(&out_cfg);
-        gpio_set_level(s_led_gpios[i], 0);
-    }
-}
+struct PendingInitialRead { uint8_t ch; uint64_t node; chip::EndpointId ep; uint8_t fabric_index; };
+static PendingInitialRead s_pending_reads[LIGHT_CHANNELS * MAX_SHADOW_BINDINGS_PER_CH];
+static int s_pending_count=0;
 
-static void button_task(void *arg)
-{
-    uint8_t stable_cnt[LIGHT_CHANNELS] = {0};
-    uint8_t last_read[LIGHT_CHANNELS] = {1,1,1,1};
-    while (true) {
-        for (int i = 0; i < LIGHT_CHANNELS; i++) {
-            int level = gpio_get_level(s_button_gpios[i]);
-            if (level == last_read[i]) { if (stable_cnt[i] < 255) stable_cnt[i]++; }
-            else { stable_cnt[i] = 0; last_read[i] = level; }
-            if (last_read[i] == 0 && stable_cnt[i] == BUTTON_STABLE_CNT) {
-                uint8_t ch = i;
-                if (s_button_evt_queue) xQueueSend(s_button_evt_queue, &ch, 0);
-            }
-        }
-        vTaskDelay(pdMS_TO_TICKS(BUTTON_POLL_MS));
-    }
-}
+static void send_initial_read(const PendingInitialRead & item){ chip::FabricIndex fi=item.fabric_index; if(fi==chip::kUndefinedFabricIndex){ for(auto &f: chip::Server::GetInstance().GetFabricTable()) if(f.IsInitialized()){ fi=f.GetFabricIndex(); break; } } if(fi==chip::kUndefinedFabricIndex) return; auto * caseMgr=chip::Server::GetInstance().GetCASESessionManager(); if(!caseMgr) return; struct Ctx{ PendingInitialRead it; }; auto * ctx=chip::Platform::New<Ctx>(); if(!ctx) return; ctx->it=item; auto onConn=[](void * c2, chip::Messaging::ExchangeManager & em, const chip::SessionHandle & sh){ std::unique_ptr<Ctx, void(*)(Ctx*)> guard((Ctx*)c2,[](Ctx* p){ chip::Platform::Delete(p); }); auto & it=guard->it; auto * cb=chip::Platform::New<InitialReadCallback>(it.ch); if(!cb) return; auto * client=chip::Platform::New<chip::app::ReadClient>(chip::app::InteractionModelEngine::GetInstance(), &em, *cb, chip::app::ReadClient::InteractionType::Read); if(!client){ chip::Platform::Delete(cb); return;} chip::app::AttributePathParams path; path.mEndpointId=it.ep; path.mClusterId=chip::app::Clusters::OnOff::Id; path.mAttributeId=chip::app::Clusters::OnOff::Attributes::OnOff::Id; chip::app::AttributePathParams paths[1]={path}; chip::app::ReadPrepareParams params(sh); params.mpAttributePathParamsList=paths; params.mAttributePathParamsListSize=1; if(client->SendRequest(params)!=CHIP_NO_ERROR){ chip::Platform::Delete(client); chip::Platform::Delete(cb);} }; auto onFail=[](void * c2, const chip::ScopedNodeId & peer, CHIP_ERROR e){ std::unique_ptr<Ctx, void(*)(Ctx*)> guard((Ctx*)c2,[](Ctx* p){ chip::Platform::Delete(p); }); ESP_LOGW(TAG,"Session fail node=0x%016" PRIX64 " err=%" CHIP_ERROR_FORMAT,(uint64_t)peer.GetNodeId(), e.Format()); }; auto * cb1=chip::Platform::New<chip::Callback::Callback<chip::OnDeviceConnected>>(onConn, ctx); auto * cb2=chip::Platform::New<chip::Callback::Callback<chip::OnDeviceConnectionFailure>>(onFail, ctx); if(!cb1||!cb2){ if(cb1) chip::Platform::Delete(cb1); if(cb2) chip::Platform::Delete(cb2); chip::Platform::Delete(ctx); return;} chip::ScopedNodeId scoped(item.node, fi); caseMgr->FindOrEstablishSession(scoped, cb1, cb2); }
 
-static void led_blink_timer_cb(void *arg) {
-    uint32_t ch = (uint32_t)arg;
-    if (ch < LIGHT_CHANNELS) {
-        // Restore steady LED state after transient blink
-        apply_led(ch, s_led_any_on[ch]);
-    }
-}
+static void schedule_single_initial_read(uint8_t ch, const ShadowBindingEntry & e){ if(e.is_group) return; if(s_pending_count >= (int)(sizeof(s_pending_reads)/sizeof(s_pending_reads[0]))) return; s_pending_reads[s_pending_count++]=PendingInitialRead{ch,e.node_id,(chip::EndpointId)e.endpoint,e.fabric_index}; s_pending_read_counts[ch]++; struct TimerCtx{ PendingInitialRead it; }; auto * tctx=chip::Platform::New<TimerCtx>(); if(!tctx) return; tctx->it=s_pending_reads[s_pending_count-1]; chip::DeviceLayer::SystemLayer().StartTimer(chip::System::Clock::Milliseconds32(0), [](chip::System::Layer*, void * arg){ auto * t=(TimerCtx*)arg; chip::DeviceLayer::PlatformMgr().ScheduleWork([](intptr_t a){ auto * t2=(TimerCtx*)a; send_initial_read(t2->it); chip::Platform::Delete(t2); }, (intptr_t)t); }, tctx); }
 
-// ---- Initial state sync (multi-binding) ----
-namespace {
-class InitialReadCallback : public chip::app::ReadClient::Callback {
-public:
-    explicit InitialReadCallback(uint8_t channel) : mChannel(channel) {}
-    void SetClient(chip::app::ReadClient * client) { mClient = client; }
-    void OnReportBegin() override { mGotAttribute = false; }
-    void OnAttributeData(const chip::app::ConcreteDataAttributePath & path, chip::TLV::TLVReader * data, const chip::app::StatusIB & status) override {
-        if (status.mStatus != chip::Protocols::InteractionModel::Status::Success) return;
-        if (path.mClusterId != chip::app::Clusters::OnOff::Id || path.mAttributeId != chip::app::Clusters::OnOff::Attributes::OnOff::Id) return;
-        bool on = false;
-        if (data && data->Get(on) == CHIP_NO_ERROR) {
-            mGotAttribute = true;
-            // Aggregation semantics: LED ON if ANY bound target reports ON in this round.
-            if (on) {
-                s_round_any_on[mChannel] = true;
-                if (!s_led_any_on[mChannel]) { s_led_any_on[mChannel] = true; apply_led(mChannel, true); }
-            }
-            ESP_LOGI(TAG, "CH%u: read ep=%u OnOff=%s (round_any_on=%s pending=%u)", mChannel, (unsigned)path.mEndpointId, on?"ON":"OFF", s_round_any_on[mChannel]?"YES":"NO", (unsigned)s_pending_read_counts[mChannel]);
-        } else {
-            ESP_LOGW(TAG, "CH%u: failed to decode initial OnOff TLV", mChannel);
-        }
-    }
-    void OnDone(chip::app::ReadClient * client) override {
-        if (!mGotAttribute) {
-            ESP_LOGI(TAG, "CH%u: initial read completed with no OnOff attribute report", mChannel);
-        }
-        if (s_pending_read_counts[mChannel] > 0) {
-            s_pending_read_counts[mChannel]--;
-            if (s_pending_read_counts[mChannel] == 0) {
-                // All scheduled reads for this channel finished. If none were ON, turn LED OFF.
-                if (!s_round_any_on[mChannel] && s_led_any_on[mChannel]) {
-                    s_led_any_on[mChannel] = false; apply_led(mChannel, false);
-                    ESP_LOGI(TAG, "CH%u: aggregate OFF after reads", mChannel);
-                } else if (s_round_any_on[mChannel]) {
-                    ESP_LOGD(TAG, "CH%u: aggregate remains ON (one or more targets ON)", mChannel);
-                }
-            }
-        }
-        if (client) chip::Platform::Delete(client);
-        chip::Platform::Delete(this);
-    }
-    // Unused callbacks
-    void OnError(CHIP_ERROR err) override { ESP_LOGW(TAG, "CH%u: initial read IM error %" CHIP_ERROR_FORMAT, mChannel, err.Format()); }
-    void OnReportEnd() override {}
-    void OnSubscriptionEstablished(chip::SubscriptionId) override {}
-private:
-    uint8_t mChannel;
-    chip::app::ReadClient * mClient = nullptr;
-    bool mGotAttribute = false;
-};
+void light_manager_sync_initial_state(){ bool any=false; for(int ch=0;ch<LIGHT_CHANNELS;ch++) if(s_pending_read_counts[ch]) { any=true; break;} if(any) return; for(int ch=0;ch<LIGHT_CHANNELS;ch++){ s_round_any_on[ch]=false; s_pending_read_counts[ch]=0;} s_pending_count=0; for(int ch=0; ch<LIGHT_CHANNELS; ch++){ auto * list=shadow_binding_get_list(ch); if(!list||!list->count) continue; for(int i=0;i<list->count;i++){ if(!list->entries[i].is_group) schedule_single_initial_read(ch, list->entries[i]); } } }
 
-struct SessionCtx { uint8_t ch; chip::EndpointId ep; };
+static void send_group_toggle(uint8_t ch); // forward
+void light_manager_button_press(uint8_t channel){ if(channel>=LIGHT_CHANNELS) return; g_last_press_tick=(uint32_t)xTaskGetTickCount(); const ShadowBindingList * list=shadow_binding_get_list(channel); int uni=0; if(list) for(int i=0;i<list->count;i++) if(!list->entries[i].is_group) uni++; ESP_LOGI(TAG,"Button press CH%u (unicast=%d)",channel,uni); if(s_led_gpios[channel]!=GPIO_NUM_NC){ apply_led(channel, !s_led_any_on[channel]); if(!s_led_blink_timers[channel]){ esp_timer_create_args_t a={ .callback=&led_blink_timer_cb, .arg=(void*)(uintptr_t)channel, .dispatch_method=ESP_TIMER_TASK, .name="ledblink" }; esp_timer_create(&a,&s_led_blink_timers[channel]); } if(s_led_blink_timers[channel]) esp_timer_start_once(s_led_blink_timers[channel], 40*1000); } send_group_toggle(channel); }
 
-    struct PendingInitialRead { uint8_t ch; uint64_t node; chip::EndpointId ep; uint8_t fabric_index; };
-    // Allow scheduling all unicast bindings each round (worst case: LIGHT_CHANNELS * MAX_SHADOW_BINDINGS_PER_CH)
-    static PendingInitialRead s_pending_reads[LIGHT_CHANNELS * MAX_SHADOW_BINDINGS_PER_CH];
-    static int s_pending_count = 0;
+static void send_group_toggle(uint8_t ch){ if(ch>=LIGHT_CHANNELS) return; s_led_any_on[ch]=!s_led_any_on[ch]; apply_led(ch, s_led_any_on[ch]); chip::DeviceLayer::PlatformMgr().ScheduleWork([](intptr_t arg){ uint8_t ch_i=(uint8_t)arg; esp_matter::client::request_handle req={}; chip::app::CommandPathParams path(g_onoff_endpoint_ids[ch_i],0, chip::app::Clusters::OnOff::Id, chip::app::Clusters::OnOff::Commands::Toggle::Id, (chip::app::CommandPathFlags)0); req.command_path=path; esp_err_t err=esp_matter::client::cluster_update(g_onoff_endpoint_ids[ch_i], &req); if(err!=ESP_OK) ESP_LOGW(TAG,"cluster_update failed ch%u err=%d", ch_i, err); else ESP_LOGI(TAG,"CH%u: Toggle dispatched", ch_i); }, (intptr_t)ch); }
 
-    static void send_initial_read(const PendingInitialRead & item) {
-        chip::FabricIndex fabricIndex = item.fabric_index;
-        if (fabricIndex == chip::kUndefinedFabricIndex) {
-            // fallback search (older saved entries may lack fabric)
-            for (auto & fabricInfo : chip::Server::GetInstance().GetFabricTable()) if (fabricInfo.IsInitialized()) { fabricIndex = fabricInfo.GetFabricIndex(); break; }
-        }
-        if (fabricIndex == chip::kUndefinedFabricIndex) { ESP_LOGW(TAG, "CH%u: no fabric for initial read", item.ch); return; }
-        auto * caseMgr = chip::Server::GetInstance().GetCASESessionManager(); if (!caseMgr) { ESP_LOGW(TAG, "CH%u: no CASE mgr", item.ch); return; }
-        struct Ctx { PendingInitialRead item; };
-        auto * ctx = chip::Platform::New<Ctx>(); if (!ctx) return; ctx->item = item;
-        auto onConnected = [](void * c2, chip::Messaging::ExchangeManager & em, const chip::SessionHandle & sessionHandle){
-            std::unique_ptr<Ctx, void(*)(Ctx*)> guard(static_cast<Ctx*>(c2), [](Ctx* p){ chip::Platform::Delete(p); });
-            auto & it = guard->item;
-            ESP_LOGI(TAG, "CH%u: session established node=0x%016" PRIX64, it.ch, it.node);
-            auto * cb = chip::Platform::New<InitialReadCallback>(it.ch);
-            if (!cb) return;
-            auto * client = chip::Platform::New<chip::app::ReadClient>(chip::app::InteractionModelEngine::GetInstance(), &em, *cb, chip::app::ReadClient::InteractionType::Read);
-            if (!client) { chip::Platform::Delete(cb); return; }
-            chip::app::AttributePathParams attrPath; attrPath.mEndpointId = it.ep; attrPath.mClusterId = chip::app::Clusters::OnOff::Id; attrPath.mAttributeId = chip::app::Clusters::OnOff::Attributes::OnOff::Id;
-            chip::app::AttributePathParams paths[1] = { attrPath };
-            chip::app::ReadPrepareParams params(sessionHandle);
-            params.mpAttributePathParamsList = paths; params.mAttributePathParamsListSize = 1;
-            auto err = client->SendRequest(params);
-            if (err != CHIP_NO_ERROR) {
-                ESP_LOGW(TAG, "CH%u: SendRequest failed (%" CHIP_ERROR_FORMAT ")", it.ch, err.Format());
-                chip::Platform::Delete(client); chip::Platform::Delete(cb);
-            } else {
-                ESP_LOGI(TAG, "CH%u: sent initial OnOff read (ep %u)", it.ch, it.ep);
-            }
-        };
-        auto onFailure = [](void * c2, const chip::ScopedNodeId & peerId, CHIP_ERROR error){
-            std::unique_ptr<Ctx, void(*)(Ctx*)> guard(static_cast<Ctx*>(c2), [](Ctx* p){ chip::Platform::Delete(p); });
-            auto & it = guard->item;
-            ESP_LOGW(TAG, "CH%u: session failure node=0x%016" PRIX64 " err=%" CHIP_ERROR_FORMAT, it.ch, (uint64_t)peerId.GetNodeId(), error.Format());
-        };
-        auto * cb1 = chip::Platform::New<chip::Callback::Callback<chip::OnDeviceConnected>>(onConnected, ctx);
-        auto * cb2 = chip::Platform::New<chip::Callback::Callback<chip::OnDeviceConnectionFailure>>(onFailure, ctx);
-        if (!cb1 || !cb2) { if (cb1) chip::Platform::Delete(cb1); if (cb2) chip::Platform::Delete(cb2); chip::Platform::Delete(ctx); return; }
-        chip::ScopedNodeId scoped(item.node, fabricIndex);
-        ESP_LOGI(TAG, "CH%u: establishing session to node 0x%016" PRIX64 " ep %u", item.ch, (uint64_t)item.node, (unsigned)item.ep);
-        caseMgr->FindOrEstablishSession(scoped, cb1, cb2);
-    }
+esp_err_t light_manager_init(){ buttons_init(); leds_init(); s_button_evt_queue=xQueueCreate(8,sizeof(uint8_t)); if(!s_button_evt_queue) return ESP_ERR_NO_MEM; xTaskCreate(button_task,"btn_poll",2048,nullptr,tskIDLE_PRIORITY+1,&s_button_task); auto act=[](void*){ uint8_t ch; while(true){ if(xQueueReceive(s_button_evt_queue,&ch,portMAX_DELAY)==pdTRUE) light_manager_button_press(ch);} }; xTaskCreate(act,"btn_act",3072,nullptr,tskIDLE_PRIORITY+2,&s_button_act_task); ESP_LOGI(TAG,"Light manager init complete"); return ESP_OK; }
 
-    static void schedule_single_initial_read(uint8_t ch, const ShadowBindingEntry & entry, uint32_t delay_ms) {
-        if (entry.is_group) return;
-        if (s_pending_count >= (int)(sizeof(s_pending_reads)/sizeof(s_pending_reads[0]))) {
-            ESP_LOGW(TAG, "Pending read array full; skipping additional schedules this round");
-            return;
-        }
-        s_pending_reads[s_pending_count++] = PendingInitialRead{ch, entry.node_id, (chip::EndpointId)entry.endpoint, entry.fabric_index};
-        if (ch < LIGHT_CHANNELS) {
-            s_pending_read_counts[ch]++;
-        }
-        // Use a one-shot timer to allow staggered start and give DNS-SD time.
-        struct TimerCtx { PendingInitialRead item; };
-        auto * tctx = chip::Platform::New<TimerCtx>(); if (!tctx) return; tctx->item = s_pending_reads[s_pending_count-1];
-        chip::DeviceLayer::SystemLayer().StartTimer(chip::System::Clock::Milliseconds32(delay_ms), [](chip::System::Layer*, void * arg){
-            auto * t = static_cast<TimerCtx*>(arg);
-            chip::DeviceLayer::PlatformMgr().ScheduleWork([](intptr_t a){
-                auto * t2 = reinterpret_cast<TimerCtx*>(a);
-                send_initial_read(t2->item);
-                chip::Platform::Delete(t2);
-            }, reinterpret_cast<intptr_t>(t));
-        }, tctx);
-    }
-
-} // anonymous namespace
-
-void light_manager_sync_initial_state() {
-    // Skip starting a new round if prior reads still pending (avoid overlapping aggregation).
-    bool any_pending=false; for (int ch=0; ch<LIGHT_CHANNELS; ++ch) if (s_pending_read_counts[ch] != 0) { any_pending=true; break; }
-    if (any_pending) { ESP_LOGD(TAG, "Skip sync: reads still pending"); return; }
-    // Reset aggregation flags and pending list index for fresh round; preserve current LED display until results arrive.
-    for (int ch = 0; ch < LIGHT_CHANNELS; ch++) { s_round_any_on[ch] = false; s_pending_read_counts[ch] = 0; }
-    s_pending_count = 0;
-    // Schedule unicast reads per channel (if any). If a channel has no bindings, leave LED unchanged.
-    for (int ch = 0; ch < LIGHT_CHANNELS; ch++) {
-        auto * list = shadow_binding_get_list(ch);
-        if (!list || list->count == 0) {
-            ESP_LOGI(TAG, "CH%u: no bindings; skip read (LED stays %s)", ch, s_led_any_on[ch]?"ON":"OFF");
-            continue;
-        }
-        bool any=false;
-        for (int i=0;i<list->count;i++) {
-            const auto & e = list->entries[i];
-            if (e.is_group) continue; // only unicast for now
-            any = true;
-            schedule_single_initial_read(ch, e, 0);
-        }
-        if (!any) {
-            ESP_LOGI(TAG, "CH%u: only group bindings; skip unicast read (LED stays %s)", ch, s_led_any_on[ch]?"ON":"OFF");
-        }
-    }
-}
-
-// ---- Button press handling ----
-void light_manager_button_press(uint8_t channel) {
-    if (channel >= LIGHT_CHANNELS) return;
-    g_last_press_tick = (uint32_t)xTaskGetTickCount();
-    // Diagnostics: log current shadow binding summary for this channel before dispatch
-    const ShadowBindingList * list = shadow_binding_get_list(channel);
-    int unicastCount=0; if (list) { for (int i=0;i<list->count;i++) if(!list->entries[i].is_group) unicastCount++; }
-    ESP_LOGI(TAG, "Button press CH%u (unicast bindings=%d)", channel, unicastCount);
-    // Transient blink: invert quickly then restore
-    if (s_led_gpios[channel] != GPIO_NUM_NC) {
-        apply_led(channel, !s_led_any_on[channel]);
-        // create one-shot timer if not exists
-        if (!s_led_blink_timers[channel]) {
-            esp_timer_create_args_t args = { .callback = &led_blink_timer_cb, .arg = (void*)(uintptr_t)channel, .dispatch_method = ESP_TIMER_TASK, .name = "ledblink" };
-            esp_timer_create(&args, &s_led_blink_timers[channel]);
-        }
-        if (s_led_blink_timers[channel]) esp_timer_start_once(s_led_blink_timers[channel], 40 * 1000); // 40ms
-    }
-    send_group_toggle(channel);
-}
-
-// ---- Command dispatch helpers ----
-static void send_group_toggle(uint8_t ch) {
-    if (ch >= LIGHT_CHANNELS) return;
-    // Optimistic local state flip for steady LED feedback until remote subscription implemented.
-    s_led_any_on[ch] = !s_led_any_on[ch];
-    apply_led(ch, s_led_any_on[ch]);
-    // Defer actual Matter command to CHIP thread to satisfy stack lock requirements.
-    chip::DeviceLayer::PlatformMgr().ScheduleWork([](intptr_t arg){
-        uint8_t ch_i = static_cast<uint8_t>(arg);
-        esp_matter::client::request_handle req = {};
-        chip::app::CommandPathParams path(
-            g_onoff_endpoint_ids[ch_i], /* group id */ 0,
-            chip::app::Clusters::OnOff::Id,
-            chip::app::Clusters::OnOff::Commands::Toggle::Id,
-            static_cast<chip::app::CommandPathFlags>(0));
-        req.command_path = path;
-        esp_err_t err = esp_matter::client::cluster_update(g_onoff_endpoint_ids[ch_i], &req);
-        if (err != ESP_OK) {
-            ESP_LOGW(TAG, "cluster_update failed (scheduled) for ch%u (ep %u): %d", ch_i, g_onoff_endpoint_ids[ch_i], err);
-        } else {
-            ESP_LOGI(TAG, "CH%u: Toggle dispatched (scheduled)", ch_i);
-        }
-    }, static_cast<intptr_t>(ch));
-}
-
-// ---- Init ----
-esp_err_t light_manager_init() {
-    buttons_init();
-    leds_init();
-    s_button_evt_queue = xQueueCreate(8, sizeof(uint8_t));
-    if (!s_button_evt_queue) return ESP_ERR_NO_MEM;
-    // Button polling task: low priority, small stack
-    xTaskCreate(button_task, "btn_poll", 2048, nullptr, tskIDLE_PRIORITY+1, &s_button_task); // latency <100ms requirement ok with poll interval
-    // Action task: process button events and dispatch cluster updates
-    auto action_task = [](void * arg){
-        uint8_t ch;
-        while (true) {
-            if (xQueueReceive(s_button_evt_queue, &ch, portMAX_DELAY) == pdTRUE) {
-                light_manager_button_press(ch);
-            }
-        }
-    };
-    xTaskCreate(action_task, "btn_act", 3072, nullptr, tskIDLE_PRIORITY+2, &s_button_act_task);
-    ESP_LOGI(TAG, "Light manager init complete");
-    return ESP_OK;
-}
-
-// DHT22 sensor task start stub (implemented elsewhere or future)
-void dht22_start_task() {}
+void dht22_start_task(){ temp_manager_start(); }
 

@@ -1,4 +1,4 @@
-idf_component_register(SRC_DIRS "." "./lights"
+idf_component_register(SRC_DIRS "." "./lights" "./temp"
                        PRIV_INCLUDE_DIRS
                          "." "./lights" "${ESP_MATTER_PATH}/examples/common/utils")
 

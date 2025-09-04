@@ -185,7 +185,7 @@ chip-tool binding write binding '[]' <controller-node-id> 1
 
 ## DHT22 Sensor Endpoints
 
-Temperature (endpoint 5) and Humidity (endpoint 6) periodically report measured values (implementation stub may need enhancement for actual sensor reads if disabled in code). Cluster IDs:
+Temperature (endpoint 5) and Humidity (endpoint 6) periodically report measured values every ~10s via a minimal bit‑banged driver. On checksum / timing failures the read is skipped; warnings appear after 3 consecutive failures. Replace with an RMT or dedicated driver for higher robustness if you experience noise. Cluster IDs:
 
 * Temperature Measurement (0x0402) – attribute MeasuredValue (0x0000) in 0.01 °C units.
 * Relative Humidity Measurement (0x0405) – attribute MeasuredValue (0x0000) in 0.01 %RH.
