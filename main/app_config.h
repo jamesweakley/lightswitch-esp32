@@ -88,18 +88,79 @@
 #define DHT22_HUM_MAX_X10 1000 // 100.0 %
 #endif
 
+// Optional tolerance (in 0.01 units) reported via the *Measurement clusters.
+// Typical DHT22 accuracy: +/-0.5°C and +/-2% RH.
+#ifndef DHT22_TEMP_TOLERANCE_0_01
+#define DHT22_TEMP_TOLERANCE_0_01 50   // 0.50°C
+#endif
+#ifndef DHT22_HUM_TOLERANCE_0_01
+#define DHT22_HUM_TOLERANCE_0_01 200   // 2.00%RH
+#endif
+
 // Threshold (microseconds) distinguishing bit '1' from '0' high pulse
 #ifndef DHT22_BIT_THRESHOLD_US
-#define DHT22_BIT_THRESHOLD_US 50
+#define DHT22_BIT_THRESHOLD_US 40 // closer to midpoint between ~26us (0) and ~70us (1)
+#endif
+// Start signal timing (host pull low then release)
+#ifndef DHT22_START_LOW_MS
+#define DHT22_START_LOW_MS 2
+#endif
+#ifndef DHT22_START_RELEASE_US
+#define DHT22_START_RELEASE_US 30
+#endif
+// Handshake/bit timing tolerances (override via build flags if needed)
+#ifndef DHT22_RESP_LOW_TIMEOUT_US
+#define DHT22_RESP_LOW_TIMEOUT_US 2000  // wait for initial sensor 80us low
+#endif
+#ifndef DHT22_RESP_HIGH_TIMEOUT_US
+#define DHT22_RESP_HIGH_TIMEOUT_US 2000 // wait for following 80us high
+#endif
+#ifndef DHT22_FIRST_BIT_PREP_TIMEOUT_US
+#define DHT22_FIRST_BIT_PREP_TIMEOUT_US 1500 // wait for first 50us low preceding bit stream
+#endif
+#ifndef DHT22_BIT_HIGH_TIMEOUT_US
+#define DHT22_BIT_HIGH_TIMEOUT_US 200   // widened to allow jitter
+#endif
+#ifndef DHT22_BIT_LOW_TIMEOUT_US
+#define DHT22_BIT_LOW_TIMEOUT_US 160    // widened
 #endif
 // Enable detailed debug logging of each DHT22 read phase (set to 1 to enable)
 #ifndef DHT22_DEBUG
-#define DHT22_DEBUG 0
+#define DHT22_DEBUG 1
 #endif
 // Optionally disable interrupts during the 40-bit capture to reduce jitter (0 = off)
 #ifndef DHT22_DISABLE_INTERRUPTS
 #define DHT22_DISABLE_INTERRUPTS 0
 #endif
+
+// Number of initial successful frames to discard (sensor warmup / stabilization)
+#ifndef DHT22_WARMUP_READS
+#define DHT22_WARMUP_READS 2
+#endif
+// Treat a frame with all data bytes zero (and valid checksum) as invalid/noise
+#ifndef DHT22_DISCARD_ZERO_FRAME
+#define DHT22_DISCARD_ZERO_FRAME 1
+#endif
+
+// RMT configuration (legacy driver) for DHT22 capture
+#ifndef DHT22_USE_RMT
+#define DHT22_USE_RMT 1
+#endif
+#if DHT22_USE_RMT
+#include <driver/rmt_rx.h>
+#ifndef DHT22_RMT_SYMBOL_CAPACITY
+#define DHT22_RMT_SYMBOL_CAPACITY 128
+#endif
+#ifndef DHT22_RMT_RESOLUTION_HZ
+#define DHT22_RMT_RESOLUTION_HZ 1000000 // 1us
+#endif
+#ifndef DHT22_RMT_IDLE_TIMEOUT_US
+#define DHT22_RMT_IDLE_TIMEOUT_US 1500
+#endif
+#ifndef DHT22_RMT_GPIO_PULLUP
+#define DHT22_RMT_GPIO_PULLUP 1
+#endif
+#endif // DHT22_USE_RMT
 
 // Default Group IDs (per channel) for group bindings
 #ifndef GROUP_ID_0

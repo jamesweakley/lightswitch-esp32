@@ -13,6 +13,7 @@
 #if CONFIG_PM_ENABLE
 #include <esp_pm.h>
 #endif
+static const char *TAG = "app_main"; // log tag
 
 #include <inttypes.h>
 
@@ -39,7 +40,7 @@
 #include <app/server/CommissioningWindowManager.h>
 #include <app/server/Server.h>
 
-static const char *TAG = "app_main";
+// (TAG already defined above for early debug helper)
 
 // Define globals declared in light_manager.h
 uint16_t g_onoff_endpoint_ids[LIGHT_CHANNELS] = {0};
@@ -611,7 +612,7 @@ extern "C" void app_main()
         ESP_LOGI(TAG, "Switch channel %d endpoint_id=%d (OnOff client)", i, g_onoff_endpoint_ids[i]);
     }
 
-    // Create Temperature and Humidity sensor endpoints
+    // Standard temperature & humidity sensor endpoints (helper creates clusters & attributes)
     {
         temperature_sensor::config_t tcfg = {};
         endpoint_t *tep = temperature_sensor::create(node, &tcfg, ENDPOINT_FLAG_NONE, NULL);
@@ -657,6 +658,7 @@ extern "C" void app_main()
     /* Matter start */
     err = esp_matter::start(app_event_cb);
     ABORT_APP_ON_FAILURE(err == ESP_OK, ESP_LOGE(TAG, "Failed to start Matter, err:%d", err));
+    // Sensor endpoints created via helpers above
     // Request callback for Toggle commands (binding manager init deferred until network ready)
     esp_matter::client::set_request_callback(
         [](chip::DeviceProxy * device, esp_matter::client::request_handle * req, void *){
