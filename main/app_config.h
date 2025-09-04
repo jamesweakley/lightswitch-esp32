@@ -22,39 +22,39 @@
 // Button GPIOs (active-low, use internal pull-ups). Use valid ESP32-C6 pins.
 // and
 // LED GPIOs for the button indicator LEDs (active-high outputs)
-#ifndef BUTTON_GPIO_0
-#define BUTTON_GPIO_0 GPIO_NUM_2
-#endif
 #ifndef LED_GPIO_0
-#define LED_GPIO_0 GPIO_NUM_3
+#define LED_GPIO_0 GPIO_NUM_0
+#endif
+#ifndef BUTTON_GPIO_0
+#define BUTTON_GPIO_0 GPIO_NUM_1
 #endif
 
-#ifndef BUTTON_GPIO_1
-#define BUTTON_GPIO_1 GPIO_NUM_23
-#endif
 #ifndef LED_GPIO_1
-#define LED_GPIO_1 GPIO_NUM_22
+#define LED_GPIO_1 GPIO_NUM_2
+#endif
+#ifndef BUTTON_GPIO_1
+#define BUTTON_GPIO_1 GPIO_NUM_21
 #endif
 
 
-#ifndef BUTTON_GPIO_2
-#define BUTTON_GPIO_2 GPIO_NUM_4
-#endif
 #ifndef LED_GPIO_2
-#define LED_GPIO_2 GPIO_NUM_5
+#define LED_GPIO_2 GPIO_NUM_18
+#endif
+#ifndef BUTTON_GPIO_2
+#define BUTTON_GPIO_2 GPIO_NUM_20
 #endif
 
 
-#ifndef BUTTON_GPIO_3
-#define BUTTON_GPIO_3 GPIO_NUM_14
-#endif
 #ifndef LED_GPIO_3
-#define LED_GPIO_3 GPIO_NUM_15
+#define LED_GPIO_3 GPIO_NUM_19
+#endif
+#ifndef BUTTON_GPIO_3
+#define BUTTON_GPIO_3 GPIO_NUM_17
 #endif
 
 // DHT22 (AM2302) data pin
 #ifndef DHT22_GPIO
-#define DHT22_GPIO GPIO_NUM_21
+#define DHT22_GPIO GPIO_NUM_16
 #endif
 
 // Enable (1) or disable (0) the DHT22 task/driver at build time (override via -DDHT22_ENABLE=0)
@@ -126,7 +126,7 @@
 #endif
 // Enable detailed debug logging of each DHT22 read phase (set to 1 to enable)
 #ifndef DHT22_DEBUG
-#define DHT22_DEBUG 1
+#define DHT22_DEBUG 0
 #endif
 // Optionally disable interrupts during the 40-bit capture to reduce jitter (0 = off)
 #ifndef DHT22_DISABLE_INTERRUPTS

@@ -75,7 +75,9 @@ Each switch endpoint (1–4) sends an OnOff Toggle to its bound targets. You can
 
 The Binding cluster (ID 0xF000) server lives on each switch endpoint (1–4). Its attribute `Binding` (ID 0x0000) is a list of binding entries. An entry can contain EITHER `{ group }` OR `{ node, endpoint, cluster }`.
 
-### Option A: Group Binding (Recommended)
+### Option A: Group Binding
+
+NOTE: This option is not currently supported, due to the way we need to read LEDs back.
 
 1. On each target light device, add it to the appropriate group (example for Group 0x0001 on endpoint 1 of target node 0x123456789ABCDEF):
    ```bash
@@ -106,20 +108,24 @@ The Binding cluster (ID 0xF000) server lives on each switch endpoint (1–4). It
 
 For a single target light with Node ID `<light-node-id>`, endpoint `<light-ep>` (which must host On/Off server cluster 0x0006):
 
+(Note) 112233 is the special Node ID for the commissioner.
+
 ```bash
-chip-tool binding write binding '[{"node":<light-node-id>,"endpoint":<light-ep>,"cluster":0x0006}]' <controller-node-id> <switch-endpoint>
+chip-tool accesscontrol write acl '[{"privilege":5,"authMode":2,"subjects":[112233],"targets":null},{"privilege":3,"authMode":2,"subjects":[<controller-node-id>],"targets":null}]' <light-node-id> <light-ep>
+```
+
+```bash
+chip-tool binding write binding '[{"node":<light-node-id>,"endpoint":<light-ep>,"cluster":6}]' <controller-node-id> <switch-endpoint>
 ```
 
 Examples:
 
-* Bind Channel 0 (endpoint 1) to a single bulb:
-  ```bash
-  chip-tool binding write binding '[{"node":0x123456789ABCDEF,"endpoint":1,"cluster":0x0006}]' <controller-node-id> 1
-  ```
-* Bind Channel 2 (endpoint 3) to two bulbs (provide a **list** with two entries):
-  ```bash
-  chip-tool binding write binding '[{"node":0x111111111111111,"endpoint":1,"cluster":0x0006},{"node":0x222222222222222,"endpoint":1,"cluster":0x0006}]' <controller-node-id> 3
-  ```
+* On SwitchController node 61, bind button 1 to light nodes 1 and 2:
+```bash
+chip-tool accesscontrol write acl '[{"privilege":5,"authMode":2,"subjects":[112233],"targets":null},{"privilege":3,"authMode":2,"subjects":[61],"targets":null}]' 1 0
+chip-tool accesscontrol write acl '[{"privilege":5,"authMode":2,"subjects":[112233],"targets":null},{"privilege":3,"authMode":2,"subjects":[61],"targets":null}]' 2 0
+chip-tool binding write binding '[{"node":2,"endpoint":1,"cluster":6},{"node":1,"endpoint":1,"cluster":6}]' 61 1
+```
 
 ### Mixed Bindings
 
